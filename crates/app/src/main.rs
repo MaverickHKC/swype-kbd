@@ -12,6 +12,9 @@ mod render;
 use keyboard::{KeyAction, VisualKeyboard};
 use render::{Canvas, Color};
 
+use std::time::Instant;
+use swype_decoder::{Decoder, Dictionary, KeyboardLayout, Point, Trace};
+
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
@@ -46,8 +49,14 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 
-/// Requested keyboard height in pixels. Width spans the output.
+/// Requested total surface height in pixels (suggestion bar + keys). Width spans
+/// the output.
 const KBD_HEIGHT: u32 = 300;
+/// Height of the suggestion bar strip at the top of the surface.
+const SUGGEST_H: u32 = 48;
+/// A press that travels less than this fraction of a key width is a tap, not a
+/// gesture.
+const TAP_FRACTION: f32 = 0.45;
 
 // --- palette ---------------------------------------------------------------
 const COL_BG: Color = Color::rgb(0x1a, 0x1c, 0x22);
@@ -55,6 +64,9 @@ const COL_KEY: Color = Color::rgb(0x33, 0x37, 0x42);
 const COL_KEY_FN: Color = Color::rgb(0x26, 0x2a, 0x33);
 const COL_KEY_PRESSED: Color = Color::rgb(0x4c, 0x8b, 0xf5);
 const COL_LABEL: Color = Color::rgb(0xe6, 0xe8, 0xee);
+const COL_TRAIL: Color = Color::rgb(0x6f, 0xa8, 0xff);
+const COL_SUGGEST_BG: Color = Color::rgb(0x12, 0x14, 0x18);
+const COL_SUGGEST_SEL: Color = Color::rgb(0x2a, 0x3a, 0x5a);
 
 fn main() {
     let conn = Connection::connect_to_env()
@@ -118,6 +130,11 @@ fn main() {
         }
     });
 
+    // The gesture decoder. Template precompute over the embedded list is cheap;
+    // the real 50k list arrives in milestone 5.
+    let decoder = Decoder::with_defaults(KeyboardLayout::qwerty(), Dictionary::english());
+    eprintln!("swype-kbd: decoder ready ({} word templates)", decoder.templates_len());
+
     let mut app = App {
         registry_state: RegistryState::new(&globals),
         seat_state,
@@ -132,6 +149,12 @@ fn main() {
         pointer: None,
         pressed: None,
         exit: false,
+        decoder,
+        gesture: Vec::new(),
+        gesture_start: None,
+        pressing: false,
+        suggestions: Vec::new(),
+        last_committed: None,
         _im_mgr: im_mgr,
         input_method,
         im_active: false,
@@ -166,6 +189,17 @@ struct App {
     /// Index into `keyboard.caps()` currently held down, for press highlight.
     pressed: Option<usize>,
     exit: bool,
+
+    // --- gesture decoding (ARCHITECTURE.md §4) ---
+    decoder: Decoder,
+    /// In-progress swipe: surface-pixel `(x, y, ms)` samples while pressing.
+    gesture: Vec<(f32, f32, u32)>,
+    gesture_start: Option<Instant>,
+    pressing: bool,
+    /// Current suggestion-bar candidates (slot 0 is the committed word).
+    suggestions: Vec<String>,
+    /// The word last committed by a gesture, for tap-to-replace.
+    last_committed: Option<String>,
 
     // --- text injection (ARCHITECTURE.md §3.3) ---
     _im_mgr: Option<ZwpInputMethodManagerV2>,
@@ -207,21 +241,38 @@ impl App {
             return;
         }
         let (w, h) = (self.width, self.height);
+        let key_h = self.key_height();
+        let off = SUGGEST_H as i32;
         let stride = w as i32 * 4;
         let (buffer, canvas) = self
             .pool
             .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
-
         {
             let mut cv = Canvas::new(canvas, w as usize, h as usize);
             cv.clear(COL_BG);
 
-            let scale = key_label_scale(h);
+            // Suggestion bar (top strip).
+            cv.fill_rect(0, 0, w as i32, SUGGEST_H as i32, COL_SUGGEST_BG);
+            let n = self.suggestions.len().min(4);
+            if n > 0 {
+                let cellw = w as i32 / n as i32;
+                let sscale = (SUGGEST_H / (font::GLYPH_H as u32 * 2)).clamp(2, 5) as usize;
+                for (i, word) in self.suggestions.iter().take(4).enumerate() {
+                    let cx = i as i32 * cellw;
+                    if i == 0 {
+                        cv.fill_rect(cx + 2, 2, cellw - 4, SUGGEST_H as i32 - 4, COL_SUGGEST_SEL);
+                    }
+                    cv.draw_text_centered(word, cx, 0, cellw, SUGGEST_H as i32, sscale, COL_LABEL);
+                }
+            }
+
+            // Keys, drawn in the area below the suggestion bar.
+            let scale = key_label_scale(key_h);
             for (i, cap) in self.keyboard.caps().iter().enumerate() {
-                let r = self.keyboard.rect_of(cap, w, h);
-                // 2px gap between keys.
-                let (kx, ky, kw, kh) = (r.x + 2, r.y + 2, r.w - 4, r.h - 4);
+                let r = self.keyboard.rect_of(cap, w, key_h);
+                // 2px gap between keys; offset by the suggestion bar height.
+                let (kx, ky, kw, kh) = (r.x + 2, r.y + off + 2, r.w - 4, r.h - 4);
                 let pressed = self.pressed == Some(i);
                 let fill = if pressed {
                     COL_KEY_PRESSED
@@ -233,6 +284,20 @@ impl App {
                 cv.fill_rect(kx, ky, kw, kh, fill);
                 if !cap.label.is_empty() {
                     cv.draw_text_centered(&cap.label, kx, ky, kw, kh, scale, COL_LABEL);
+                }
+            }
+
+            // Live gesture trail.
+            if self.pressing && self.gesture.len() >= 2 {
+                for win in self.gesture.windows(2) {
+                    cv.draw_line(
+                        win[0].0 as i32,
+                        win[0].1 as i32,
+                        win[1].0 as i32,
+                        win[1].1 as i32,
+                        4,
+                        COL_TRAIL,
+                    );
                 }
             }
         }
@@ -247,16 +312,154 @@ impl App {
         let _ = qh;
     }
 
+    /// Usable key-area height (total minus the suggestion bar).
+    fn key_height(&self) -> u32 {
+        self.height.saturating_sub(SUGGEST_H)
+    }
+
+    /// Map a surface pixel to decoder keyboard-units. The key area is 10 units
+    /// wide and 4 rows tall, so letter-row centers land at y = 0.5/1.5/2.5,
+    /// matching the decoder's QWERTY centroids.
+    fn px_to_unit(&self, x: f32, y: f32, t: u32) -> Point {
+        let ux = (self.width as f32 / 10.0).max(1.0);
+        let uy = (self.key_height() as f32 / 4.0).max(1.0);
+        Point::new(x / ux, (y - SUGGEST_H as f32) / uy, t)
+    }
+
     fn on_press(&mut self, x: f64, y: f64, qh: &QueueHandle<Self>) {
-        let hit = self
-            .keyboard
-            .hit_index(x as i32, y as i32, self.width, self.height);
-        if let Some(i) = hit {
+        let (px, py) = (x as f32, y as f32);
+
+        // A press in the suggestion bar replaces the committed word.
+        if (py as u32) < SUGGEST_H {
+            if let Some(word) = self.suggestion_at(px) {
+                self.replace_with(&word);
+                self.draw(qh);
+            }
+            return;
+        }
+
+        // Otherwise begin capturing a press in the key area. Whether it is a tap
+        // or a gesture is decided on release. Starting fresh clears any prior
+        // suggestions / committed-word state.
+        self.suggestions.clear();
+        self.last_committed = None;
+        self.gesture.clear();
+        self.gesture_start = Some(Instant::now());
+        self.gesture.push((px, py, 0));
+        self.pressing = true;
+        self.pressed =
+            self.keyboard
+                .hit_index(px as i32, py as i32 - SUGGEST_H as i32, self.width, self.key_height());
+        self.draw(qh);
+    }
+
+    fn on_motion(&mut self, x: f64, y: f64, qh: &QueueHandle<Self>) {
+        if !self.pressing {
+            return;
+        }
+        let t = self
+            .gesture_start
+            .map(|s| s.elapsed().as_millis() as u32)
+            .unwrap_or(0);
+        self.gesture.push((x as f32, y as f32, t));
+        // Once the press has clearly become a swipe, drop the key highlight.
+        if self.pressed.is_some() && pixel_path_len(&self.gesture) > self.tap_threshold() {
+            self.pressed = None;
+        }
+        self.draw(qh);
+    }
+
+    fn on_release(&mut self, qh: &QueueHandle<Self>) {
+        if !self.pressing {
+            return;
+        }
+        self.pressing = false;
+
+        let is_gesture = self.gesture.len() >= 3 && pixel_path_len(&self.gesture) > self.tap_threshold();
+        if is_gesture {
+            self.run_gesture();
+        } else if let Some(i) = self.pressed {
             let action = self.keyboard.caps()[i].action;
             self.handle_action(action);
-            self.pressed = Some(i);
-            self.draw(qh);
         }
+        self.pressed = None;
+        self.gesture.clear();
+        self.draw(qh);
+    }
+
+    /// Minimum pixel travel for a press to count as a gesture.
+    fn tap_threshold(&self) -> f32 {
+        (self.width as f32 / 10.0) * TAP_FRACTION
+    }
+
+    /// Decode the captured swipe and commit the top candidate, populating the
+    /// suggestion bar with the alternates.
+    fn run_gesture(&mut self) {
+        let pts: Vec<Point> = self
+            .gesture
+            .iter()
+            .map(|&(x, y, t)| self.px_to_unit(x, y, t))
+            .collect();
+        let trace = Trace::from_points(pts);
+        let cands = self.decoder.decode(&trace);
+        match cands.first() {
+            Some(top) => {
+                let word = top.word.clone();
+                self.commit_word(&word);
+                self.suggestions = cands.iter().take(4).map(|c| c.word.clone()).collect();
+                let alts: Vec<&String> = self.suggestions.iter().skip(1).collect();
+                println!("gesture -> '{word}'  alternates: {alts:?}");
+            }
+            None => println!("gesture -> (no candidates)"),
+        }
+    }
+
+    /// Commit a decoded word followed by a space, via whichever channel is live.
+    fn commit_word(&mut self, word: &str) {
+        let text = format!("{word} ");
+        if !self.commit_text(&text) {
+            for ch in text.chars() {
+                if let Some(code) = input::char_to_keycode(ch) {
+                    self.vk_tap(code);
+                }
+            }
+        }
+        self.last_committed = Some(word.to_string());
+    }
+
+    /// Replace the previously committed gesture word with `word` (tap-to-replace
+    /// from the suggestion bar): delete the old word+space, commit the new one.
+    fn replace_with(&mut self, word: &str) {
+        if let Some(prev) = self.last_committed.clone() {
+            let del = (prev.len() + 1) as u32; // +1 for the trailing space (ASCII)
+            if self.im_active {
+                if let Some(im) = &self.input_method {
+                    im.delete_surrounding_text(del, 0);
+                    im.commit(self.im_serial);
+                }
+            } else {
+                for _ in 0..del {
+                    self.vk_tap(input::KEY_BACKSPACE);
+                }
+            }
+        }
+        self.commit_word(word);
+        // Move the chosen word into slot 0 so it shows as selected.
+        if let Some(pos) = self.suggestions.iter().position(|w| w == word) {
+            self.suggestions.swap(0, pos);
+        }
+        println!("replace -> '{word}'");
+    }
+
+    /// Which suggestion (if any) sits under pixel x in the suggestion bar.
+    fn suggestion_at(&self, px: f32) -> Option<String> {
+        let n = self.suggestions.len().min(4);
+        if n == 0 {
+            return None;
+        }
+        let cell = self.width as f32 / n as f32;
+        let idx = ((px / cell) as usize).min(n - 1);
+        Some(self.suggestions[idx].clone())
     }
 
     /// Inject the result of a key press into the focused application.
@@ -318,12 +521,17 @@ impl App {
         self.key_time = self.key_time.wrapping_add(1);
         t
     }
+}
 
-    fn on_release(&mut self, qh: &QueueHandle<Self>) {
-        if self.pressed.take().is_some() {
-            self.draw(qh);
-        }
-    }
+/// Total length of a pixel polyline.
+fn pixel_path_len(g: &[(f32, f32, u32)]) -> f32 {
+    g.windows(2)
+        .map(|w| {
+            let dx = w[1].0 - w[0].0;
+            let dy = w[1].1 - w[0].1;
+            (dx * dx + dy * dy).sqrt()
+        })
+        .sum()
 }
 
 /// Scale factor for key labels, derived from row height so labels stay legible.
@@ -481,7 +689,15 @@ impl PointerHandler for App {
                     let (x, y) = event.position;
                     self.on_press(x, y, qh);
                 }
+                PointerEventKind::Motion { .. } => {
+                    let (x, y) = event.position;
+                    self.on_motion(x, y, qh);
+                }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
+                    self.on_release(qh);
+                }
+                // Pointer left the surface mid-swipe: finalize what we have.
+                PointerEventKind::Leave { .. } => {
                     self.on_release(qh);
                 }
                 _ => {}

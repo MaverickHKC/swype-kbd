@@ -105,6 +105,33 @@ impl<'a> Canvas<'a> {
         self.fill_rect(x + w - t, y, t, h, c); // right
     }
 
+    /// Draw a `thick`-pixel line from `(x0,y0)` to `(x1,y1)` (Bresenham, square
+    /// caps). Used for the live gesture trail.
+    pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, thick: i32, c: Color) {
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        let h = thick.max(1);
+        loop {
+            self.fill_rect(x - h / 2, y - h / 2, h, h, c);
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
     /// Draw one bitmap glyph at integer `scale`, top-left at `(x, y)`.
     pub fn blit_glyph(&mut self, ch: char, x: i32, y: i32, scale: usize, c: Color) {
         let g = font::glyph_or_box(ch);

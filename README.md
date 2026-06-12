@@ -9,18 +9,19 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestone plan.
 
 ## Status
 
-**Milestone 3 — SHARK2 decoder.** The `swype-decoder` crate now ranks dictionary
-words for a swipe: ideal templates from letter centroids, a shape channel
-(scale/translation-invariant) and a location channel, a Zipfian frequency prior,
-and a start/end pruning gate. A seeded synthetic perturbation harness (jitter,
-corner-cutting, overshoot) measures accuracy — currently **top-1 94%, top-3
-100%** at moderate perturbation over the embedded word list. Not yet wired to the
-keyboard surface.
+**Milestone 4 — gesture typing.** Swiping a word is wired end to end: the pointer
+trace is captured (with a live trail), decoded on release, and the top candidate
+is committed with a trailing space; a suggestion bar shows alternates, and
+tapping one replaces the committed word. Taps still type single characters. A
+press is classified as tap vs. gesture by travel distance.
 
 Earlier:
-- **Milestone 2** — tap typing into the focused app via `zwp_input_method_v2`
-  (`commit_string`) with a `zwp_virtual_keyboard_v1` fallback (embedded US xkb
-  keymap); Backspace/Enter as real key events.
+- **Milestone 3** — SHARK2 decoder in `swype-decoder` (shape + location channels,
+  Zipfian prior, start/end pruning). Synthetic perturbation harness: top-1 94%,
+  top-3 100% over the embedded list.
+- **Milestone 2** — tap typing via `zwp_input_method_v2` (`commit_string`) with a
+  `zwp_virtual_keyboard_v1` fallback (embedded US xkb keymap); Backspace/Enter as
+  real key events.
 - **Milestone 1** — bottom-docked layer-shell surface, software-rendered QWERTY,
   pointer hit-testing.
 
