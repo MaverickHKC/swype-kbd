@@ -18,6 +18,10 @@ pub struct DecoderParams {
     pub shape_sigma: f32,
     /// Gaussian width of the location channel (keyboard units).
     pub loc_sigma: f32,
+    /// Gaussian width of the endpoint channel (keyboard units). Tighter than
+    /// `loc_sigma`: the first and last points are placed deliberately, so they
+    /// disambiguate words that differ only at the ends (e.g. hell-o vs hel-p).
+    pub end_sigma: f32,
     /// Weight of the log-frequency prior.
     pub beta: f32,
     /// Pruning radius (keyboard units) for the start/end gate.
@@ -35,6 +39,7 @@ impl Default for DecoderParams {
             n: 100,
             shape_sigma: 0.18,
             loc_sigma: 0.55,
+            end_sigma: 0.45,
             beta: 0.25,
             prune_radius: 1.8,
             max_candidates: 8,
@@ -58,21 +63,42 @@ pub struct Decoder {
     dict: Dictionary,
     templates: Vec<Template>,
     params: DecoderParams,
+    /// Lowercase word -> index into `templates`, for `learn`.
+    index: std::collections::HashMap<String, usize>,
 }
 
 impl Decoder {
     /// Build a decoder, precomputing a template for every gestureable word.
     pub fn new(layout: KeyboardLayout, dict: Dictionary, params: DecoderParams) -> Self {
-        let templates = (0..dict.len())
+        let templates: Vec<Template> = (0..dict.len())
             .filter_map(|i| {
                 Template::build(i, dict.word(i), dict.ln_freq(i), &layout, params.n)
             })
+            .collect();
+        let index = templates
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (dict.word(t.word_index).to_string(), i))
             .collect();
         Decoder {
             layout,
             dict,
             templates,
             params,
+            index,
+        }
+    }
+
+    /// Adjust a word's log-frequency prior by `delta` (per-user learning).
+    /// Returns true if the word has a template. The change affects all future
+    /// `decode` calls; persistence is the caller's responsibility.
+    pub fn learn(&mut self, word: &str, delta: f32) -> bool {
+        match self.index.get(&word.to_ascii_lowercase()) {
+            Some(&i) => {
+                self.templates[i].ln_freq += delta;
+                true
+            }
+            None => false,
         }
     }
 
@@ -113,17 +139,23 @@ impl Decoder {
 
         let shape_k = 1.0 / (2.0 * p.shape_sigma * p.shape_sigma);
         let loc_k = 1.0 / (2.0 * p.loc_sigma * p.loc_sigma);
+        let end_k = 1.0 / (2.0 * p.end_sigma * p.end_sigma);
 
         let mut out: Vec<Candidate> = Vec::new();
         for t in &self.templates {
             // Pruning gate: the swipe must begin near the first key and end near
-            // the last key of the candidate word.
-            if dist2(start, t.start) > r2 || dist2(end, t.end) > r2 {
+            // the last key of the candidate word. Reuse these squared distances
+            // as the endpoint channel.
+            let d_start = dist2(start, t.start);
+            let d_end = dist2(end, t.end);
+            if d_start > r2 || d_end > r2 {
                 continue;
             }
             let shape_dist = mean_dist(&shape_in, &t.shape);
             let loc_dist = mean_dist(&loc_in, &t.loc);
-            let score = -(shape_dist * shape_dist) * shape_k - (loc_dist * loc_dist) * loc_k
+            let score = -(shape_dist * shape_dist) * shape_k
+                - (loc_dist * loc_dist) * loc_k
+                - (d_start + d_end) * end_k
                 + p.beta * t.ln_freq;
             out.push(Candidate {
                 word: self.dict.word(t.word_index).to_string(),
@@ -177,6 +209,24 @@ mod tests {
             let cands = dec.decode(&trace);
             assert_eq!(cands[0].word, w, "ideal trace for {w} -> {:?}", cands[0]);
         }
+    }
+
+    #[test]
+    fn learning_boosts_a_word_up_the_ranking() {
+        let kb = KeyboardLayout::qwerty();
+        let mut dec = decoder();
+        // Find a swipe whose top candidate is not some target alternate, then
+        // boost that alternate and confirm it climbs.
+        let trace = sample_stroke("that", &kb, 64).unwrap();
+        let before = dec.decode(&trace);
+        assert_eq!(before[0].word, "that");
+        // Pick the runner-up and boost it hard.
+        let alt = before[1].word.clone();
+        assert!(dec.learn(&alt, 50.0));
+        let after = dec.decode(&trace);
+        assert_eq!(after[0].word, alt, "boosted word should now rank first");
+        // Unknown words are a no-op.
+        assert!(!dec.learn("zzzzqx", 1.0));
     }
 
     #[test]
@@ -314,7 +364,7 @@ mod tests {
         let dec = decoder();
         let (p1, p3, total) = measure(&dec, 0.45, 4, 0xC0FFEE_1234);
         println!("accuracy: top1={p1:.3} top3={p3:.3} over {total} trials");
-        assert!(p1 > 0.90, "top-1 accuracy regressed: {p1:.3}");
+        assert!(p1 > 0.96, "top-1 accuracy regressed: {p1:.3}");
         assert!(p3 > 0.99, "top-3 accuracy regressed: {p3:.3}");
     }
 }

@@ -30,7 +30,8 @@ enum Shift {
     Lock,
 }
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use swype_decoder::{Decoder, Dictionary, KeyboardLayout, Point, Trace};
 
@@ -153,12 +154,19 @@ fn main() {
     // fall back to the small embedded list.
     let (dict, source) = load_dictionary();
     let t0 = Instant::now();
-    let decoder = Decoder::with_defaults(KeyboardLayout::qwerty(), dict);
+    let mut decoder = Decoder::with_defaults(KeyboardLayout::qwerty(), dict);
+    // Apply persisted per-user learning on top of the base frequencies.
+    let learned_path = learned_path();
+    let learned = load_learned(&learned_path);
+    for (word, boost) in &learned {
+        decoder.learn(word, *boost);
+    }
     eprintln!(
-        "swype-kbd: decoder ready — {} word templates from {} (built in {} ms)",
+        "swype-kbd: decoder ready — {} word templates from {} (built in {} ms); {} learned words",
         decoder.templates_len(),
         source,
-        t0.elapsed().as_millis()
+        t0.elapsed().as_millis(),
+        learned.len(),
     );
 
     let mut app = App {
@@ -181,6 +189,8 @@ fn main() {
         pending_cap: false,
         last_shift_tap: None,
         decoder,
+        learned,
+        learned_path,
         gesture: Vec::new(),
         gesture_start: None,
         pressing: false,
@@ -235,6 +245,10 @@ struct App {
 
     // --- gesture decoding (ARCHITECTURE.md §4) ---
     decoder: Decoder,
+    /// Per-user learned frequency boosts (lowercase word -> cumulative boost),
+    /// persisted to `learned_path`.
+    learned: HashMap<String, f32>,
+    learned_path: PathBuf,
     /// In-progress swipe: surface-pixel `(x, y, ms)` samples while pressing.
     gesture: Vec<(f32, f32, u32)>,
     gesture_start: Option<Instant>,
@@ -258,6 +272,54 @@ struct App {
     _keymap_file: Option<std::fs::File>,
     /// Monotonic timestamp for synthesized key events.
     key_time: u32,
+}
+
+/// Per-correction frequency boost. A correction rewards the chosen word (up to
+/// `LEARN_CAP`) and decays the rejected word's accumulated boost back toward
+/// zero — never negative, so a rejected word is never suppressed below its
+/// natural rank and always stays pickable in the suggestions. The reward plus
+/// the rejected word's decay together swing the score gap enough that one or two
+/// corrections flip a confusable pair.
+const LEARN_DELTA: f32 = 8.0;
+const LEARN_CAP: f32 = 24.0;
+
+/// Path to the persisted per-user learned-words file (XDG state dir).
+fn learned_path() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("swype-kbd").join("learned.txt")
+}
+
+/// Load `word boost` lines into a map (lowercase keys). Missing file -> empty.
+fn load_learned(path: &Path) -> HashMap<String, f32> {
+    let mut map = HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(w), Some(b)) = (it.next(), it.next()) {
+                if let Ok(boost) = b.parse::<f32>() {
+                    map.insert(w.to_ascii_lowercase(), boost);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Persist the learned-words map. Best-effort; errors are logged, not fatal.
+fn save_learned(path: &Path, map: &HashMap<String, f32>) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut s = String::new();
+    for (w, b) in map {
+        s.push_str(&format!("{w} {b}\n"));
+    }
+    if let Err(e) = std::fs::write(path, s) {
+        eprintln!("swype-kbd: could not save learned words to {}: {e}", path.display());
+    }
 }
 
 /// Candidate paths for the external word+count dictionary, most specific first.
@@ -547,7 +609,9 @@ impl App {
     /// Replace the previously committed gesture word with `word` (tap-to-replace
     /// from the suggestion bar): delete the old word+space, commit the new one.
     fn replace_with(&mut self, word: &str) {
-        if let Some(prev) = self.last_committed.clone() {
+        // The word being replaced is the one the user is rejecting.
+        let rejected = self.last_committed.clone();
+        if let Some(prev) = &rejected {
             let del = (prev.len() + 1) as u32; // +1 for the trailing space (ASCII)
             if self.im_active {
                 if let Some(im) = &self.input_method {
@@ -565,7 +629,37 @@ impl App {
         if let Some(pos) = self.suggestions.iter().position(|w| w == word) {
             self.suggestions.swap(0, pos);
         }
-        println!("replace -> '{word}'");
+        // Learn relatively: reward the chosen word, dock the rejected one, so a
+        // confusable pair converges instead of the first-boosted word sticking.
+        self.adjust_learning(word, LEARN_DELTA);
+        if let Some(r) = &rejected {
+            if r.to_ascii_lowercase() != word.to_ascii_lowercase() {
+                self.adjust_learning(r, -LEARN_DELTA);
+            }
+        }
+        save_learned(&self.learned_path, &self.learned);
+        println!("replace -> '{word}' (rejected {rejected:?})");
+    }
+
+    /// Nudge a word's learned frequency boost by `delta`, clamped to
+    /// `[0, LEARN_CAP]` (never negative, so a penalized word only loses its
+    /// accumulated boost, never drops below base rank), and apply the change to
+    /// the live decoder.
+    fn adjust_learning(&mut self, word: &str, delta: f32) {
+        let key = word.to_ascii_lowercase();
+        let old = self.learned.get(&key).copied().unwrap_or(0.0);
+        let new = (old + delta).clamp(0.0, LEARN_CAP);
+        let applied = new - old;
+        if applied.abs() < f32::EPSILON {
+            return; // already at the clamp
+        }
+        if new.abs() < f32::EPSILON {
+            self.learned.remove(&key);
+        } else {
+            self.learned.insert(key.clone(), new);
+        }
+        self.decoder.learn(&key, applied);
+        println!("learned '{key}' -> {new:+.1}");
     }
 
     /// Which suggestion (if any) sits under pixel x in the suggestion bar.
