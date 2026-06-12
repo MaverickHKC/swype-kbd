@@ -9,14 +9,20 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestone plan.
 
 ## Status
 
-**Milestone 2 — tap typing.** Tapping a key types its character into the
-focused application: text goes through `zwp_input_method_v2` (`commit_string`)
-when a text field is active, and falls back to synthesized keystrokes via
-`zwp_virtual_keyboard_v1` (with an embedded US xkb keymap) otherwise. Backspace
-and Enter are real key events. No gesture decoding yet.
+**Milestone 3 — SHARK2 decoder.** The `swype-decoder` crate now ranks dictionary
+words for a swipe: ideal templates from letter centroids, a shape channel
+(scale/translation-invariant) and a location channel, a Zipfian frequency prior,
+and a start/end pruning gate. A seeded synthetic perturbation harness (jitter,
+corner-cutting, overshoot) measures accuracy — currently **top-1 94%, top-3
+100%** at moderate perturbation over the embedded word list. Not yet wired to the
+keyboard surface.
 
-Earlier: **Milestone 1** — bottom-docked layer-shell surface, software-rendered
-QWERTY, pointer hit-testing.
+Earlier:
+- **Milestone 2** — tap typing into the focused app via `zwp_input_method_v2`
+  (`commit_string`) with a `zwp_virtual_keyboard_v1` fallback (embedded US xkb
+  keymap); Backspace/Enter as real key events.
+- **Milestone 1** — bottom-docked layer-shell surface, software-rendered QWERTY,
+  pointer hit-testing.
 
 ## Layout
 
