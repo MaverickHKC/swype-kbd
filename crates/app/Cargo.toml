@@ -14,3 +14,7 @@ path = "src/main.rs"
 swype-decoder = { path = "../decoder" }
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
+# input-method-v2 + virtual-keyboard-v1 bindings (not wrapped by SCTK).
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+# memfd for handing the xkb keymap to the virtual keyboard.
+rustix = { version = "1", features = ["fs"] }

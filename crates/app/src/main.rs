@@ -5,6 +5,7 @@
 //! stdout. No text injection or gesture decoding yet (see ARCHITECTURE.md §5).
 
 mod font;
+mod input;
 mod keyboard;
 mod render;
 
@@ -34,7 +35,15 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
+};
+use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
+    zwp_input_method_v2::{self, ZwpInputMethodV2},
+};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 
 /// Requested keyboard height in pixels. Width spans the output.
@@ -74,9 +83,44 @@ fn main() {
     let pool = SlotPool::new((1920 * KBD_HEIGHT * 4) as usize, &shm)
         .expect("failed to create shm slot pool");
 
+    // Text-injection setup (ARCHITECTURE.md §3.3). Both managers are seat-global
+    // and independent of the layer surface. Either may be absent on a
+    // non-wlroots compositor; degrade gracefully with a warning.
+    let seat_state = SeatState::new(&globals, &qh);
+    let seat = seat_state.seats().next();
+    if seat.is_none() {
+        eprintln!("warning: no wl_seat; pointer input and text injection disabled");
+    }
+
+    let im_mgr = globals
+        .bind::<ZwpInputMethodManagerV2, _, _>(&qh, 1..=1, ())
+        .map_err(|e| eprintln!("warning: input-method-v2 unavailable ({e}); text path disabled"))
+        .ok();
+    let vk_mgr = globals
+        .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&qh, 1..=1, ())
+        .map_err(|e| eprintln!("warning: virtual-keyboard-v1 unavailable ({e}); key synth disabled"))
+        .ok();
+
+    let input_method = match (&im_mgr, &seat) {
+        (Some(m), Some(s)) => Some(m.get_input_method(s, &qh, ())),
+        _ => None,
+    };
+    let virtual_keyboard = match (&vk_mgr, &seat) {
+        (Some(m), Some(s)) => Some(m.create_virtual_keyboard(s, &qh, ())),
+        _ => None,
+    };
+    // Upload the US keymap to the virtual keyboard once; keep the memfd alive.
+    let keymap_file = virtual_keyboard.as_ref().and_then(|vk| match upload_keymap(vk) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("warning: failed to upload keymap ({e}); key synth disabled");
+            None
+        }
+    });
+
     let mut app = App {
         registry_state: RegistryState::new(&globals),
-        seat_state: SeatState::new(&globals, &qh),
+        seat_state,
         output_state: OutputState::new(&globals, &qh),
         shm,
         pool,
@@ -88,6 +132,15 @@ fn main() {
         pointer: None,
         pressed: None,
         exit: false,
+        _im_mgr: im_mgr,
+        input_method,
+        im_active: false,
+        im_pending_active: false,
+        im_serial: 0,
+        _vk_mgr: vk_mgr,
+        virtual_keyboard,
+        _keymap_file: keymap_file,
+        key_time: 0,
     };
 
     eprintln!("swype-kbd: layer surface created; waiting for configure…");
@@ -113,6 +166,38 @@ struct App {
     /// Index into `keyboard.caps()` currently held down, for press highlight.
     pressed: Option<usize>,
     exit: bool,
+
+    // --- text injection (ARCHITECTURE.md §3.3) ---
+    _im_mgr: Option<ZwpInputMethodManagerV2>,
+    input_method: Option<ZwpInputMethodV2>,
+    /// Whether a text field is currently focused (input-method `activate`d).
+    im_active: bool,
+    /// Pending activation state, applied on the next `done`.
+    im_pending_active: bool,
+    /// Count of `done` events received — the serial for `commit`.
+    im_serial: u32,
+    _vk_mgr: Option<ZwpVirtualKeyboardManagerV1>,
+    virtual_keyboard: Option<ZwpVirtualKeyboardV1>,
+    _keymap_file: Option<std::fs::File>,
+    /// Monotonic timestamp for synthesized key events.
+    key_time: u32,
+}
+
+/// Write the embedded keymap into a memfd and hand it to the virtual keyboard.
+/// The returned `File` must be kept alive until the compositor has read the fd.
+fn upload_keymap(vk: &ZwpVirtualKeyboardV1) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let fd = rustix::fs::memfd_create("swype-keymap", rustix::fs::MemfdFlags::CLOEXEC)?;
+    let mut file = std::fs::File::from(fd);
+    file.write_all(input::KEYMAP.as_bytes())?;
+    file.write_all(&[0])?; // wl_keyboard keymaps are NUL-terminated
+    file.flush()?;
+    let size = input::KEYMAP.len() as u32 + 1;
+    vk.keymap(input::KEYMAP_FORMAT_XKB_V1, file.as_fd(), size);
+    vk.modifiers(0, 0, 0, 0); // start from a known, all-released modifier state
+    Ok(file)
 }
 
 impl App {
@@ -167,11 +252,71 @@ impl App {
             .keyboard
             .hit_index(x as i32, y as i32, self.width, self.height);
         if let Some(i) = hit {
-            let cap = &self.keyboard.caps()[i];
-            print_action(cap.action);
+            let action = self.keyboard.caps()[i].action;
+            self.handle_action(action);
             self.pressed = Some(i);
             self.draw(qh);
         }
+    }
+
+    /// Inject the result of a key press into the focused application.
+    ///
+    /// Text (letters, space, punctuation) goes through input-method
+    /// `commit_string` when a field is active, else falls back to synthesized
+    /// keystrokes. Backspace and Enter are always real key events: apps treat
+    /// them as keys, so they correctly delete a selection, repeat, submit forms,
+    /// etc. (`delete_surrounding_text` is reserved for gesture word-replace in
+    /// milestone 4, where we delete a known committed range, not a selection.)
+    fn handle_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::Char(c) => {
+                let mut buf = [0u8; 4];
+                if !self.commit_text(c.encode_utf8(&mut buf)) {
+                    if let Some(code) = input::char_to_keycode(c) {
+                        self.vk_tap(code);
+                    }
+                }
+            }
+            KeyAction::Space => {
+                if !self.commit_text(" ") {
+                    self.vk_tap(input::char_to_keycode(' ').unwrap());
+                }
+            }
+            KeyAction::Backspace => self.vk_tap(input::KEY_BACKSPACE),
+            KeyAction::Enter => self.vk_tap(input::KEY_ENTER),
+            KeyAction::Shift | KeyAction::Symbols => {} // not wired in milestone 2
+        }
+        print_action(action); // keep the M1 stdout trace for debugging
+    }
+
+    /// Commit text via the input-method channel. Returns false if no field is
+    /// active (caller should fall back to the virtual keyboard).
+    fn commit_text(&self, text: &str) -> bool {
+        match (self.im_active, &self.input_method) {
+            (true, Some(im)) => {
+                im.commit_string(text.to_string());
+                im.commit(self.im_serial);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Synthesize a press+release of an evdev keycode via the virtual keyboard.
+    fn vk_tap(&mut self, keycode: u32) {
+        let Some(vk) = self.virtual_keyboard.clone() else {
+            return;
+        };
+        let t = self.next_time();
+        vk.key(t, keycode, input::STATE_PRESSED);
+        let t = self.next_time();
+        vk.key(t, keycode, input::STATE_RELEASED);
+    }
+
+    fn next_time(&mut self) -> u32 {
+        let t = self.key_time;
+        self.key_time = self.key_time.wrapping_add(1);
+        t
     }
 
     fn on_release(&mut self, qh: &QueueHandle<Self>) {
@@ -374,3 +519,71 @@ delegate_seat!(App);
 delegate_pointer!(App);
 delegate_layer!(App);
 delegate_registry!(App);
+
+// --- input-method-v2 / virtual-keyboard-v1 (not covered by SCTK delegates) ---
+
+impl Dispatch<ZwpInputMethodV2, ()> for App {
+    fn event(
+        state: &mut Self,
+        _: &ZwpInputMethodV2,
+        event: zwp_input_method_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwp_input_method_v2::Event;
+        match event {
+            // activate/deactivate are pending until the batch's `done`.
+            Event::Activate => state.im_pending_active = true,
+            Event::Deactivate => state.im_pending_active = false,
+            Event::Done => {
+                state.im_active = state.im_pending_active;
+                state.im_serial = state.im_serial.wrapping_add(1);
+            }
+            Event::Unavailable => {
+                eprintln!("input-method: another input method is active; using key synth only");
+                state.input_method = None;
+                state.im_active = false;
+            }
+            // surrounding_text / text_change_cause / content_type: unused in M2.
+            _ => {}
+        }
+    }
+}
+
+// The two managers and the virtual keyboard emit no events.
+impl Dispatch<ZwpInputMethodManagerV2, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpInputMethodManagerV2,
+        _: <ZwpInputMethodManagerV2 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpVirtualKeyboardManagerV1,
+        _: <ZwpVirtualKeyboardManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpVirtualKeyboardV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpVirtualKeyboardV1,
+        _: <ZwpVirtualKeyboardV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}

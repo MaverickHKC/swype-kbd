@@ -9,9 +9,14 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestone plan.
 
 ## Status
 
-**Milestone 1 — layer-shell skeleton.** A bottom-docked keyboard surface that
-software-renders a static QWERTY layout and prints the key hit by each pointer
-press to stdout. No text injection or gesture decoding yet.
+**Milestone 2 — tap typing.** Tapping a key types its character into the
+focused application: text goes through `zwp_input_method_v2` (`commit_string`)
+when a text field is active, and falls back to synthesized keystrokes via
+`zwp_virtual_keyboard_v1` (with an embedded US xkb keymap) otherwise. Backspace
+and Enter are real key events. No gesture decoding yet.
+
+Earlier: **Milestone 1** — bottom-docked layer-shell surface, software-rendered
+QWERTY, pointer hit-testing.
 
 ## Layout
 
