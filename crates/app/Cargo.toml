@@ -1,0 +1,16 @@
+[package]
+name = "swype-kbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Swipe-typing on-screen keyboard for Wayland (wlroots/Sway)."
+
+[[bin]]
+name = "swype-kbd"
+path = "src/main.rs"
+
+[dependencies]
+swype-decoder = { path = "../decoder" }
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"

@@ -1,0 +1,11 @@
+[package]
+name = "swype-decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SHARK2-style gesture-keyboard decoder. No Wayland, no I/O — pure and unit-testable."
+
+[dependencies]
+
+[dev-dependencies]
