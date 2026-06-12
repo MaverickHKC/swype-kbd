@@ -434,6 +434,27 @@ impl App {
                 }
             }
 
+            // Key pop-up preview: while a character key is held (a tap, not yet
+            // a swipe), show a magnified copy above it — the finger covers the
+            // real key on a touchscreen.
+            if self.pressing {
+                if let Some(i) = self.pressed {
+                    let caps = self.keyboard.caps(kind);
+                    if let Some(cap) = caps.get(i) {
+                        if matches!(cap.action, KeyAction::Char(_)) && !cap.label.is_empty() {
+                            let r = self.keyboard.rect_of(cap, w, key_h);
+                            let pw = (r.w as f32 * 1.5) as i32;
+                            let ph = (r.h as f32 * 1.3) as i32;
+                            let px = (r.x + (r.w - pw) / 2).clamp(0, w as i32 - pw);
+                            let py = (r.y + off - ph - 6).max(0);
+                            cv.fill_rect(px, py, pw, ph, COL_KEY_PRESSED);
+                            let pscale = (scale + 2).min(8);
+                            cv.draw_text_centered(&cap.label, px, py, pw, ph, pscale, COL_LABEL);
+                        }
+                    }
+                }
+            }
+
             // Live gesture trail.
             if self.pressing && self.gesture.len() >= 2 {
                 for win in self.gesture.windows(2) {
