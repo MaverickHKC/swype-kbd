@@ -38,12 +38,13 @@ use swype_decoder::{Decoder, Dictionary, KeyboardLayout, Point, Trace};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_seat, delegate_shm, delegate_touch,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT},
+        touch::TouchHandler,
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -57,7 +58,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface, wl_touch},
     Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
@@ -181,6 +182,8 @@ fn main() {
         height: KBD_HEIGHT,
         configured: false,
         pointer: None,
+        touch: None,
+        active_touch: None,
         pressed: None,
         exit: false,
         base: Base::Letters,
@@ -227,6 +230,9 @@ struct App {
     height: u32,
     configured: bool,
     pointer: Option<wl_pointer::WlPointer>,
+    touch: Option<wl_touch::WlTouch>,
+    /// The touch-point id currently driving a press/gesture (single-touch).
+    active_touch: Option<i32>,
     /// Index into the current layer's caps currently held down, for highlight.
     pressed: Option<usize>,
     exit: bool,
@@ -541,6 +547,14 @@ impl App {
             let action = self.keyboard.caps(self.current_kind())[i].action;
             self.handle_action(action);
         }
+        self.pressed = None;
+        self.gesture.clear();
+        self.draw(qh);
+    }
+
+    /// Abandon an in-progress press without committing anything (touch cancel).
+    fn on_cancel(&mut self, qh: &QueueHandle<Self>) {
+        self.pressing = false;
         self.pressed = None;
         self.gesture.clear();
         self.draw(qh);
@@ -983,6 +997,12 @@ impl SeatHandler for App {
                     .expect("failed to get pointer"),
             );
         }
+        if capability == Capability::Touch && self.touch.is_none() {
+            match self.seat_state.get_touch(qh, &seat) {
+                Ok(t) => self.touch = Some(t),
+                Err(e) => eprintln!("swype-kbd: failed to get touch: {e}"),
+            }
+        }
     }
 
     fn remove_capability(
@@ -996,6 +1016,12 @@ impl SeatHandler for App {
             if let Some(p) = self.pointer.take() {
                 p.release();
             }
+        }
+        if capability == Capability::Touch {
+            if let Some(t) = self.touch.take() {
+                t.release();
+            }
+            self.active_touch = None;
         }
     }
 
@@ -1037,6 +1063,85 @@ impl PointerHandler for App {
     }
 }
 
+impl TouchHandler for App {
+    fn down(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _serial: u32,
+        _time: u32,
+        surface: wl_surface::WlSurface,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        // Single-touch: the first finger down drives the press/gesture; ignore
+        // additional simultaneous touches until it lifts.
+        if surface != *self.layer.wl_surface() || self.active_touch.is_some() {
+            return;
+        }
+        self.active_touch = Some(id);
+        self.on_press(position.0, position.1, qh);
+    }
+
+    fn up(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _serial: u32,
+        _time: u32,
+        id: i32,
+    ) {
+        if self.active_touch == Some(id) {
+            self.active_touch = None;
+            self.on_release(qh);
+        }
+    }
+
+    fn motion(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _time: u32,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        if self.active_touch == Some(id) {
+            self.on_motion(position.0, position.1, qh);
+        }
+    }
+
+    fn cancel(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_touch::WlTouch) {
+        // The compositor took over the touch sequence (e.g. a system gesture):
+        // abandon the in-progress press without committing.
+        self.active_touch = None;
+        self.on_cancel(qh);
+    }
+
+    fn shape(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _id: i32,
+        _major: f64,
+        _minor: f64,
+    ) {
+    }
+
+    fn orientation(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_touch::WlTouch,
+        _id: i32,
+        _orientation: f64,
+    ) {
+    }
+}
+
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
@@ -1064,6 +1169,7 @@ delegate_output!(App);
 delegate_shm!(App);
 delegate_seat!(App);
 delegate_pointer!(App);
+delegate_touch!(App);
 delegate_layer!(App);
 delegate_registry!(App);
 
