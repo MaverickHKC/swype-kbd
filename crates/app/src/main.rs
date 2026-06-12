@@ -31,7 +31,7 @@ enum Shift {
 }
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use swype_decoder::{Decoder, Dictionary, KeyboardLayout, Point, Trace};
 
 use smithay_client_toolkit::{
@@ -179,6 +179,7 @@ fn main() {
         shift: Shift::Off,
         auto_space: false,
         pending_cap: false,
+        last_shift_tap: None,
         decoder,
         gesture: Vec::new(),
         gesture_start: None,
@@ -229,6 +230,8 @@ struct App {
     /// A sentence just ended; capitalize the next letter typed on the letters
     /// layer (auto-capitalization).
     pending_cap: bool,
+    /// Timestamp of the last Shift tap, for double-tap caps-lock detection.
+    last_shift_tap: Option<Instant>,
 
     // --- gesture decoding (ARCHITECTURE.md §4) ---
     decoder: Decoder,
@@ -603,10 +606,21 @@ impl App {
                 self.pending_cap = true; // new line starts a sentence
             }
             KeyAction::Shift => {
-                self.shift = match self.shift {
-                    Shift::Off => Shift::OneShot,
-                    Shift::OneShot => Shift::Lock,
-                    Shift::Lock => Shift::Off,
+                // Single tap toggles shift on/off; a quick double-tap latches
+                // caps lock (matching iOS/Gboard). From any on-state a single
+                // tap returns to Off.
+                let now = Instant::now();
+                let double_tap = self
+                    .last_shift_tap
+                    .map(|t| now.duration_since(t) < Duration::from_millis(400))
+                    .unwrap_or(false);
+                self.last_shift_tap = Some(now);
+                self.shift = if double_tap {
+                    Shift::Lock
+                } else if self.shift == Shift::Off {
+                    Shift::OneShot
+                } else {
+                    Shift::Off
                 };
                 self.pending_cap = false; // explicit shift overrides auto-cap
             }
