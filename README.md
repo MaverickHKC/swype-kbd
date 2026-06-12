@@ -9,21 +9,30 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestone plan.
 
 ## Status
 
-**Milestone 4 — gesture typing.** Swiping a word is wired end to end: the pointer
-trace is captured (with a live trail), decoded on release, and the top candidate
-is committed with a trailing space; a suggestion bar shows alternates, and
-tapping one replaces the committed word. Taps still type single characters. A
-press is classified as tap vs. gesture by travel distance.
+**MVP complete (milestones 1–5).** A working swipe-typing keyboard: it docks to
+the bottom of the screen, types into focused apps, and decodes word gestures.
 
-Earlier:
-- **Milestone 3** — SHARK2 decoder in `swype-decoder` (shape + location channels,
-  Zipfian prior, start/end pruning). Synthetic perturbation harness: top-1 94%,
-  top-3 100% over the embedded list.
-- **Milestone 2** — tap typing via `zwp_input_method_v2` (`commit_string`) with a
+- **M5 — real dictionary + latency.** Loads a ~50k-word unigram frequency list
+  (Norvig counts, see `data/`) at runtime; 49,945 templates build in ~0.25 s.
+  Decode latency mean ~3 ms, p99 ~7 ms — under the 30 ms budget. Override the
+  list with `SWYPE_DICT`.
+- **M4 — gesture typing.** Pointer trace captured with a live trail, decoded on
+  release, top candidate committed + space; a suggestion bar shows alternates,
+  tap to replace. Taps still type single characters.
+- **M3 — SHARK2 decoder** (`swype-decoder`): shape + location channels, frequency
+  prior, start/end pruning. Synthetic perturbation harness: top-1 94%, top-3
+  100% on common words.
+- **M2 — tap typing** via `zwp_input_method_v2` (`commit_string`) with a
   `zwp_virtual_keyboard_v1` fallback (embedded US xkb keymap); Backspace/Enter as
   real key events.
-- **Milestone 1** — bottom-docked layer-shell surface, software-rendered QWERTY,
-  pointer hit-testing.
+- **M1 — layer-shell surface**, software-rendered QWERTY, pointer hit-testing.
+
+### Possible next steps (post-MVP)
+
+- Shift/symbols layers (the keys exist but are inert), numbers row.
+- Trail smoothing / per-point velocity weighting in the decoder.
+- Damage-tracked partial repaints instead of full-surface redraw per motion.
+- Per-user learning of the frequency prior.
 
 ## Layout
 

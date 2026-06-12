@@ -253,6 +253,60 @@ mod tests {
         }
     }
 
+    /// Latency + accuracy against the real ~50k unigram list (milestone 5).
+    /// Skipped unless `data/words_50k.txt` exists at the workspace root. Run:
+    /// `cargo test -p swype-decoder latency_50k -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn latency_50k() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/words_50k.txt");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            println!("skip: {path} not found");
+            return;
+        };
+        let kb = KeyboardLayout::qwerty();
+        let dict = Dictionary::parse_counts(&text);
+        let t0 = std::time::Instant::now();
+        let dec = Decoder::with_defaults(kb.clone(), dict);
+        println!(
+            "built {} templates in {} ms",
+            dec.templates_len(),
+            t0.elapsed().as_millis()
+        );
+
+        // Accuracy over common words (top of the list), then latency timing.
+        let (p1, p3, total) = measure(&dec, 0.45, 4, 0xBEEF_5050);
+        println!("50k accuracy (top-150 common words): top1={p1:.3} top3={p3:.3} n={total}");
+
+        let words: Vec<String> = dec
+            .dictionary()
+            .words()
+            .iter()
+            .filter(|w| w.chars().count() >= 3 && ideal_trace(w, &kb).is_some())
+            .take(500)
+            .cloned()
+            .collect();
+        let mut rng = Rng::new(0x1234_5050);
+        let mut times_us: Vec<u128> = Vec::new();
+        for w in &words {
+            let trace = human_like(w, &kb, &mut rng, 0.45).unwrap();
+            let t = std::time::Instant::now();
+            let _ = dec.decode(&trace);
+            times_us.push(t.elapsed().as_micros());
+        }
+        times_us.sort_unstable();
+        let mean = times_us.iter().sum::<u128>() as f64 / times_us.len() as f64;
+        let p50 = times_us[times_us.len() / 2];
+        let p99 = times_us[times_us.len() * 99 / 100];
+        let max = *times_us.last().unwrap();
+        println!(
+            "decode latency over {} swipes: mean={:.0}us p50={p50}us p99={p99}us max={max}us",
+            times_us.len(),
+            mean
+        );
+        assert!(p99 < 30_000, "p99 decode {p99}us exceeds 30ms budget");
+    }
+
     /// The headline metric: top-1 / top-3 accuracy on perturbed synthetic
     /// swipes. Tune DecoderParams against this.
     #[test]

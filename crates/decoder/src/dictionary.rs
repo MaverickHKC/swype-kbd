@@ -62,7 +62,21 @@ impl Dictionary {
         Dictionary { words, ln_freq }
     }
 
-    /// The embedded English frequency list (~few hundred common words).
+    /// Parse a whitespace-separated `word count` list (one per line, e.g. the
+    /// Norvig unigram list). Lines that don't parse are skipped. Order is
+    /// irrelevant; weights come from the counts.
+    pub fn parse_counts(text: &str) -> Self {
+        let pairs = text.lines().filter_map(|line| {
+            let mut it = line.split_whitespace();
+            let word = it.next()?;
+            let count: f64 = it.next()?.parse().ok()?;
+            Some((word.to_string(), count))
+        });
+        Self::from_counts(pairs)
+    }
+
+    /// The embedded English frequency list (~few hundred common words). Used as
+    /// a fallback when no external dictionary file is found.
     pub fn english() -> Self {
         Self::from_ranked(include_str!("words_en.txt").lines())
     }
@@ -119,6 +133,15 @@ mod tests {
             assert!(w.chars().all(|c| c.is_ascii_lowercase()));
         }
         assert!(d.rank_of("the").is_some());
+    }
+
+    #[test]
+    fn parse_counts_reads_word_count_lines() {
+        let d = Dictionary::parse_counts("the 100\nword 40\n\nbad-line\nمرحبا 5\nfoo notanumber\n");
+        // "the" and "word" parse; blank/garbage/non-ascii-count lines drop.
+        assert!(d.rank_of("the").is_some());
+        assert!(d.rank_of("word").is_some());
+        assert!(d.ln_freq(d.rank_of("the").unwrap()) > d.ln_freq(d.rank_of("word").unwrap()));
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod render;
 use keyboard::{KeyAction, VisualKeyboard};
 use render::{Canvas, Color};
 
+use std::path::PathBuf;
 use std::time::Instant;
 use swype_decoder::{Decoder, Dictionary, KeyboardLayout, Point, Trace};
 
@@ -130,10 +131,17 @@ fn main() {
         }
     });
 
-    // The gesture decoder. Template precompute over the embedded list is cheap;
-    // the real 50k list arrives in milestone 5.
-    let decoder = Decoder::with_defaults(KeyboardLayout::qwerty(), Dictionary::english());
-    eprintln!("swype-kbd: decoder ready ({} word templates)", decoder.templates_len());
+    // The gesture decoder. Load the external ~50k unigram list if present, else
+    // fall back to the small embedded list.
+    let (dict, source) = load_dictionary();
+    let t0 = Instant::now();
+    let decoder = Decoder::with_defaults(KeyboardLayout::qwerty(), dict);
+    eprintln!(
+        "swype-kbd: decoder ready — {} word templates from {} (built in {} ms)",
+        decoder.templates_len(),
+        source,
+        t0.elapsed().as_millis()
+    );
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -215,6 +223,40 @@ struct App {
     _keymap_file: Option<std::fs::File>,
     /// Monotonic timestamp for synthesized key events.
     key_time: u32,
+}
+
+/// Candidate paths for the external word+count dictionary, most specific first.
+fn dict_paths() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(p) = std::env::var("SWYPE_DICT") {
+        v.push(PathBuf::from(p));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("words_50k.txt"));
+            // Repo layout: target/{debug,release}/swype-kbd -> ../../data/...
+            v.push(dir.join("../../data/words_50k.txt"));
+            // Installed layout: bin/swype-kbd -> ../share/swype-kbd/...
+            v.push(dir.join("../share/swype-kbd/words_50k.txt"));
+        }
+    }
+    v.push(PathBuf::from("data/words_50k.txt"));
+    v
+}
+
+/// Load the dictionary from the first readable candidate path, falling back to
+/// the embedded list. Returns the dictionary and a human-readable source label.
+fn load_dictionary() -> (Dictionary, String) {
+    for path in dict_paths() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let dict = Dictionary::parse_counts(&text);
+            if !dict.is_empty() {
+                return (dict, path.display().to_string());
+            }
+        }
+    }
+    eprintln!("swype-kbd: no external dictionary found (set SWYPE_DICT or place data/words_50k.txt); using embedded list");
+    (Dictionary::english(), "embedded list".to_string())
 }
 
 /// Write the embedded keymap into a memfd and hand it to the virtual keyboard.
@@ -401,16 +443,18 @@ impl App {
             .map(|&(x, y, t)| self.px_to_unit(x, y, t))
             .collect();
         let trace = Trace::from_points(pts);
+        let t0 = Instant::now();
         let cands = self.decoder.decode(&trace);
+        let decode_us = t0.elapsed().as_micros();
         match cands.first() {
             Some(top) => {
                 let word = top.word.clone();
                 self.commit_word(&word);
                 self.suggestions = cands.iter().take(4).map(|c| c.word.clone()).collect();
                 let alts: Vec<&String> = self.suggestions.iter().skip(1).collect();
-                println!("gesture -> '{word}'  alternates: {alts:?}");
+                println!("gesture -> '{word}'  alternates: {alts:?}  ({decode_us} us)");
             }
-            None => println!("gesture -> (no candidates)"),
+            None => println!("gesture -> (no candidates)  ({decode_us} us)"),
         }
     }
 
