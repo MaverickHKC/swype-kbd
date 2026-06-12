@@ -19,6 +19,10 @@ brackets/math) cover the full ASCII set. Capitals and shifted symbols type
 correctly through both the input-method and virtual-keyboard (Shift-held)
 channels.
 
+**Smart typing.** Gesture words commit with a trailing space; punctuation tucks
+against the word (`hello .` → `hello.`), and the first letter after a
+sentence-ending `. ! ?` (or Enter) auto-capitalizes via a one-shot shift.
+
 - **M5 — real dictionary + latency.** Loads a ~50k-word unigram frequency list
   (Norvig counts, see `data/`) at runtime; 49,945 templates build in ~0.25 s.
   Decode latency mean ~3 ms, p99 ~7 ms — under the 30 ms budget. Override the
@@ -39,7 +43,7 @@ channels.
 - Trail smoothing / per-point velocity weighting in the decoder.
 - Damage-tracked partial repaints instead of full-surface redraw per motion.
 - Per-user learning of the frequency prior.
-- Auto-space/punctuation handling, undo-on-backspace of a committed word.
+- Undo-on-backspace of a just-committed gesture word.
 
 ## Layout
 

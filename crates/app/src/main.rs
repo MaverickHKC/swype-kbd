@@ -177,6 +177,8 @@ fn main() {
         exit: false,
         base: Base::Letters,
         shift: Shift::Off,
+        auto_space: false,
+        pending_cap: false,
         decoder,
         gesture: Vec::new(),
         gesture_start: None,
@@ -221,6 +223,12 @@ struct App {
     // --- input layers ---
     base: Base,
     shift: Shift,
+    /// True right after a word was committed with a trailing auto-space, so the
+    /// next punctuation can tuck in against the word (smart spacing).
+    auto_space: bool,
+    /// A sentence just ended; capitalize the next letter typed on the letters
+    /// layer (auto-capitalization).
+    pending_cap: bool,
 
     // --- gesture decoding (ARCHITECTURE.md §4) ---
     decoder: Decoder,
@@ -501,6 +509,7 @@ impl App {
                 if self.shift == Shift::OneShot {
                     self.shift = Shift::Off;
                 }
+                self.pending_cap = false; // a word isn't a sentence end
                 self.commit_word(&word);
                 self.suggestions = cands
                     .iter()
@@ -529,6 +538,7 @@ impl App {
             }
         }
         self.last_committed = Some(word.to_string());
+        self.auto_space = true;
     }
 
     /// Replace the previously committed gesture word with `word` (tap-to-replace
@@ -575,28 +585,30 @@ impl App {
     /// shift; a one-shot shift is consumed after the next character.
     fn handle_action(&mut self, action: KeyAction) {
         match action {
-            KeyAction::Char(c) => {
-                let mut buf = [0u8; 4];
-                if !self.commit_text(c.encode_utf8(&mut buf)) {
-                    self.vk_type_char(c);
-                }
-                if self.shift == Shift::OneShot {
-                    self.shift = Shift::Off;
-                }
-            }
+            KeyAction::Char(c) => self.type_key_char(c),
             KeyAction::Space => {
                 if !self.commit_text(" ") {
                     self.vk_type_char(' ');
                 }
+                self.auto_space = false;
             }
-            KeyAction::Backspace => self.vk_tap(input::KEY_BACKSPACE),
-            KeyAction::Enter => self.vk_tap(input::KEY_ENTER),
+            KeyAction::Backspace => {
+                self.vk_tap(input::KEY_BACKSPACE);
+                self.auto_space = false;
+                self.pending_cap = false;
+            }
+            KeyAction::Enter => {
+                self.vk_tap(input::KEY_ENTER);
+                self.auto_space = false;
+                self.pending_cap = true; // new line starts a sentence
+            }
             KeyAction::Shift => {
                 self.shift = match self.shift {
                     Shift::Off => Shift::OneShot,
                     Shift::OneShot => Shift::Lock,
                     Shift::Lock => Shift::Off,
                 };
+                self.pending_cap = false; // explicit shift overrides auto-cap
             }
             KeyAction::ToLetters => self.base = Base::Letters,
             KeyAction::ToSymbols1 => {
@@ -605,7 +617,57 @@ impl App {
             }
             KeyAction::ToSymbols2 => self.base = Base::Symbols2,
         }
+        self.apply_autocap();
         print_action(action); // keep the stdout trace for debugging
+    }
+
+    /// Type a tapped character, applying smart spacing (tuck punctuation against
+    /// a preceding auto-spaced word) and arming auto-capitalization after a
+    /// sentence end.
+    fn type_key_char(&mut self, c: char) {
+        if self.auto_space && is_tight_punct(c) {
+            // "word ." -> "word. ": drop the trailing space, then "<punct> ".
+            self.delete_one();
+            self.type_char(c);
+            self.type_char(' ');
+            self.auto_space = true;
+        } else {
+            self.type_char(c);
+            self.auto_space = false;
+        }
+        if c.is_ascii_alphabetic() && self.shift == Shift::OneShot {
+            self.shift = Shift::Off;
+        }
+        self.pending_cap = is_sentence_end(c);
+    }
+
+    /// If a sentence just ended, latch a one-shot shift so the next letter
+    /// capitalizes (only when the user hasn't set shift themselves).
+    fn apply_autocap(&mut self) {
+        if self.pending_cap && self.base == Base::Letters && self.shift == Shift::Off {
+            self.shift = Shift::OneShot;
+        }
+    }
+
+    /// Type one character: input-method commit when a field is active, else a
+    /// synthesized keystroke.
+    fn type_char(&mut self, c: char) {
+        let mut buf = [0u8; 4];
+        if !self.commit_text(c.encode_utf8(&mut buf)) {
+            self.vk_type_char(c);
+        }
+    }
+
+    /// Delete one character before the cursor via whichever channel is live.
+    fn delete_one(&mut self) {
+        if self.im_active {
+            if let Some(im) = &self.input_method {
+                im.delete_surrounding_text(1, 0);
+                im.commit(self.im_serial);
+                return;
+            }
+        }
+        self.vk_tap(input::KEY_BACKSPACE);
     }
 
     /// Commit text via the input-method channel. Returns false if no field is
@@ -678,6 +740,17 @@ fn key_label_scale(height: u32) -> usize {
     // 4 rows; aim for a glyph ~1/3 of the row height.
     let row_h = height / 4;
     ((row_h / (font::GLYPH_H as u32 * 2)).max(1)).min(6) as usize
+}
+
+/// Punctuation that should sit tight against the preceding word (no space
+/// before it) under smart spacing.
+fn is_tight_punct(c: char) -> bool {
+    matches!(c, '.' | ',' | '!' | '?' | ';' | ':')
+}
+
+/// Punctuation that ends a sentence (arms auto-capitalization).
+fn is_sentence_end(c: char) -> bool {
+    matches!(c, '.' | '!' | '?')
 }
 
 /// Uppercase the first character of a word.
