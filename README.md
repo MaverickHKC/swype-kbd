@@ -9,8 +9,15 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestone plan.
 
 ## Status
 
-**MVP complete (milestones 1–5).** A working swipe-typing keyboard: it docks to
-the bottom of the screen, types into focused apps, and decodes word gestures.
+**MVP complete (milestones 1–5) + input layers.** A working swipe-typing
+keyboard: it docks to the bottom of the screen, types into focused apps, and
+decodes word gestures.
+
+**Input layers.** A Shift key (one-shot → caps-lock → off) capitalizes taps and
+gesture-committed words; two symbol pages (numbers/punctuation and
+brackets/math) cover the full ASCII set. Capitals and shifted symbols type
+correctly through both the input-method and virtual-keyboard (Shift-held)
+channels.
 
 - **M5 — real dictionary + latency.** Loads a ~50k-word unigram frequency list
   (Norvig counts, see `data/`) at runtime; 49,945 templates build in ~0.25 s.
@@ -27,12 +34,12 @@ the bottom of the screen, types into focused apps, and decodes word gestures.
   real key events.
 - **M1 — layer-shell surface**, software-rendered QWERTY, pointer hit-testing.
 
-### Possible next steps (post-MVP)
+### Possible next steps
 
-- Shift/symbols layers (the keys exist but are inert), numbers row.
 - Trail smoothing / per-point velocity weighting in the decoder.
 - Damage-tracked partial repaints instead of full-surface redraw per motion.
 - Per-user learning of the frequency prior.
+- Auto-space/punctuation handling, undo-on-backspace of a committed word.
 
 ## Layout
 

@@ -1,20 +1,32 @@
-//! The on-screen keyboard's *visual* layout: the rectangles we draw and
-//! hit-test. Letter centroids for the decoder live in `swype_decoder::layout`;
-//! this adds the function keys (space, backspace, …) and the pixel geometry.
-//!
-//! Caps are defined in **unit space** — a 10-wide × 4-tall grid — then scaled to
-//! the surface size at render/hit-test time, so the layout is resolution
-//! independent.
+//! The on-screen keyboard's *visual* layout across input layers: lowercase and
+//! uppercase letters plus two symbol pages. Each layer is a list of caps in
+//! unit space (a 10-wide × 4-tall grid), scaled to the surface at draw/hit-test
+//! time. Letter centroids for the decoder live in `swype_decoder::layout`.
 
-/// What pressing a cap does. In milestone 1 every action is just logged.
+/// What pressing a cap does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
     Char(char),
     Space,
     Backspace,
     Enter,
+    /// Toggle shift (Off → one-shot → lock → Off).
     Shift,
-    Symbols,
+    /// Switch to the lowercase letter layer.
+    ToLetters,
+    /// Switch to symbol page 1 (numbers + punctuation).
+    ToSymbols1,
+    /// Switch to symbol page 2 (brackets + math).
+    ToSymbols2,
+}
+
+/// Which concrete layer is being displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    LettersLower,
+    LettersUpper,
+    Symbols1,
+    Symbols2,
 }
 
 /// One drawable/hit-testable key, positioned in unit space.
@@ -43,51 +55,39 @@ impl Rect {
     }
 }
 
-/// The full visual keyboard.
+/// The full visual keyboard: one cap list per layer.
 pub struct VisualKeyboard {
-    caps: Vec<Cap>,
+    lower: Vec<Cap>,
+    upper: Vec<Cap>,
+    sym1: Vec<Cap>,
+    sym2: Vec<Cap>,
     cols: f32,
     rows: f32,
 }
 
 impl VisualKeyboard {
-    /// US-QWERTY with a function row, matching ARCHITECTURE.md milestone 1.
-    pub fn qwerty() -> Self {
-        let mut caps = Vec::new();
-
-        // Row 0: q…p, ten 1-unit keys, no indent.
-        for (col, ch) in "qwertyuiop".chars().enumerate() {
-            caps.push(letter(ch, col as f32, 0.0));
-        }
-        // Row 1: a…l, nine keys, indented half a unit.
-        for (col, ch) in "asdfghjkl".chars().enumerate() {
-            caps.push(letter(ch, 0.5 + col as f32, 1.0));
-        }
-        // Row 2: [shift] z…m [backspace], spanning the full width.
-        caps.push(func(KeyAction::Shift, "SH", 0.0, 2.0, 1.5));
-        for (col, ch) in "zxcvbnm".chars().enumerate() {
-            caps.push(letter(ch, 1.5 + col as f32, 2.0));
-        }
-        caps.push(func(KeyAction::Backspace, "<", 8.5, 2.0, 1.5));
-        // Row 3: [?123] [,] [ space ] [.] [enter].
-        caps.push(func(KeyAction::Symbols, "?12", 0.0, 3.0, 1.5));
-        caps.push(func(KeyAction::Char(','), ",", 1.5, 3.0, 1.0));
-        caps.push(func(KeyAction::Space, "", 2.5, 3.0, 5.0));
-        caps.push(func(KeyAction::Char('.'), ".", 7.5, 3.0, 1.0));
-        caps.push(func(KeyAction::Enter, "ENT", 8.5, 3.0, 1.5));
-
+    pub fn new() -> Self {
         VisualKeyboard {
-            caps,
+            lower: letter_layer(false),
+            upper: letter_layer(true),
+            sym1: symbols1(),
+            sym2: symbols2(),
             cols: 10.0,
             rows: 4.0,
         }
     }
 
-    pub fn caps(&self) -> &[Cap] {
-        &self.caps
+    /// The caps for a given layer.
+    pub fn caps(&self, kind: LayerKind) -> &[Cap] {
+        match kind {
+            LayerKind::LettersLower => &self.lower,
+            LayerKind::LettersUpper => &self.upper,
+            LayerKind::Symbols1 => &self.sym1,
+            LayerKind::Symbols2 => &self.sym2,
+        }
     }
 
-    /// Grid extents in unit space. Used by the gesture renderer (milestone 4).
+    /// Grid extents in unit space. Used by the gesture renderer.
     #[allow(dead_code)]
     pub fn cols(&self) -> f32 {
         self.cols
@@ -97,7 +97,7 @@ impl VisualKeyboard {
         self.rows
     }
 
-    /// Pixel rect of a cap for a surface of `width × height`.
+    /// Pixel rect of a cap for a surface region of `width × height`.
     pub fn rect_of(&self, cap: &Cap, width: u32, height: u32) -> Rect {
         let ux = width as f32 / self.cols;
         let uy = height as f32 / self.rows;
@@ -109,24 +109,94 @@ impl VisualKeyboard {
         }
     }
 
-    /// Index of the cap under pixel `(px, py)`, if any.
-    pub fn hit_index(&self, px: i32, py: i32, width: u32, height: u32) -> Option<usize> {
-        self.caps
+    /// Index (into `caps(kind)`) of the cap under pixel `(px, py)`, if any.
+    pub fn hit_index(&self, kind: LayerKind, px: i32, py: i32, width: u32, height: u32) -> Option<usize> {
+        self.caps(kind)
             .iter()
             .position(|c| self.rect_of(c, width, height).contains(px, py))
     }
+}
 
-    /// The cap under pixel `(px, py)`, if any.
-    #[allow(dead_code)] // convenience wrapper exercised by tests; app uses hit_index
-    pub fn hit_test(&self, px: i32, py: i32, width: u32, height: u32) -> Option<&Cap> {
-        self.hit_index(px, py, width, height).map(|i| &self.caps[i])
+impl Default for VisualKeyboard {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-fn letter(ch: char, x: f32, y: f32) -> Cap {
+// --- layer builders --------------------------------------------------------
+
+fn letter_layer(upper: bool) -> Vec<Cap> {
+    let mut caps = Vec::new();
+    for (col, ch) in "qwertyuiop".chars().enumerate() {
+        caps.push(letter(ch, upper, col as f32, 0.0));
+    }
+    for (col, ch) in "asdfghjkl".chars().enumerate() {
+        caps.push(letter(ch, upper, 0.5 + col as f32, 1.0));
+    }
+    caps.push(func(KeyAction::Shift, "SH", 0.0, 2.0, 1.5));
+    for (col, ch) in "zxcvbnm".chars().enumerate() {
+        caps.push(letter(ch, upper, 1.5 + col as f32, 2.0));
+    }
+    caps.push(func(KeyAction::Backspace, "<", 8.5, 2.0, 1.5));
+    bottom_row(&mut caps, KeyAction::ToSymbols1, "?12");
+    caps
+}
+
+fn symbols1() -> Vec<Cap> {
+    // row0 + row1 are full 10-wide; row2 is [page] + 7 + [backspace].
+    symbol_layer("1234567890", "@#$&-+()/:", "*\"'_;!?", KeyAction::ToSymbols2, "#+=")
+}
+
+fn symbols2() -> Vec<Cap> {
+    symbol_layer("[](){}<>|\\", "~`^=+-*/%_", "@#$&\";:", KeyAction::ToSymbols1, "123")
+}
+
+/// Build a symbol page from three character rows (10, 10, 7 chars) and the
+/// label/action of the page-toggle key at the bottom-left of row 2.
+fn symbol_layer(row0: &str, row1: &str, row2mid: &str, toggle: KeyAction, toggle_label: &str) -> Vec<Cap> {
+    let mut caps = Vec::new();
+    for (col, ch) in row0.chars().enumerate() {
+        caps.push(sym(ch, col as f32, 0.0));
+    }
+    for (col, ch) in row1.chars().enumerate() {
+        caps.push(sym(ch, col as f32, 1.0));
+    }
+    caps.push(func(toggle, toggle_label, 0.0, 2.0, 1.5));
+    for (col, ch) in row2mid.chars().enumerate() {
+        caps.push(sym(ch, 1.5 + col as f32, 2.0));
+    }
+    caps.push(func(KeyAction::Backspace, "<", 8.5, 2.0, 1.5));
+    bottom_row(&mut caps, KeyAction::ToLetters, "ABC");
+    caps
+}
+
+/// The shared bottom row: [layer-switch] [,] [space] [.] [enter]. `switch` is
+/// the action/label of the left-most key (to-symbols on letters, to-letters on
+/// symbol pages).
+fn bottom_row(caps: &mut Vec<Cap>, switch: KeyAction, switch_label: &str) {
+    caps.push(func(switch, switch_label, 0.0, 3.0, 1.5));
+    caps.push(func(KeyAction::Char(','), ",", 1.5, 3.0, 1.0));
+    caps.push(func(KeyAction::Space, "", 2.5, 3.0, 5.0));
+    caps.push(func(KeyAction::Char('.'), ".", 7.5, 3.0, 1.0));
+    caps.push(func(KeyAction::Enter, "ENT", 8.5, 3.0, 1.5));
+}
+
+fn letter(ch: char, upper: bool, x: f32, y: f32) -> Cap {
+    let typed = if upper { ch.to_ascii_uppercase() } else { ch };
+    Cap {
+        action: KeyAction::Char(typed),
+        label: ch.to_ascii_uppercase().to_string(),
+        x,
+        y,
+        w: 1.0,
+        h: 1.0,
+    }
+}
+
+fn sym(ch: char, x: f32, y: f32) -> Cap {
     Cap {
         action: KeyAction::Char(ch),
-        label: ch.to_ascii_uppercase().to_string(),
+        label: ch.to_string(),
         x,
         y,
         w: 1.0,
@@ -149,40 +219,74 @@ fn func(action: KeyAction, label: &str, x: f32, y: f32, w: f32) -> Cap {
 mod tests {
     use super::*;
 
+    fn row_width(caps: &[Cap], row: i32) -> f32 {
+        caps.iter().filter(|c| c.y as i32 == row).map(|c| c.w).sum()
+    }
+
     #[test]
-    fn caps_cover_full_width_each_row() {
-        let kb = VisualKeyboard::qwerty();
-        for row in 0..4 {
-            let w: f32 = kb
-                .caps()
-                .iter()
-                .filter(|c| c.y as i32 == row)
-                .map(|c| c.w)
-                .sum();
-            // Rows 0/1 are letter rows that don't span the full 10 units; rows
-            // 2/3 must fill it exactly.
-            if row >= 2 {
-                assert!((w - 10.0).abs() < 1e-3, "row {row} width {w}");
+    fn symbol_rows_fill_full_width() {
+        let kb = VisualKeyboard::new();
+        for kind in [LayerKind::Symbols1, LayerKind::Symbols2] {
+            for row in 0..4 {
+                let w = row_width(kb.caps(kind), row);
+                assert!((w - 10.0).abs() < 1e-3, "{kind:?} row {row} width {w}");
             }
         }
     }
 
     #[test]
-    fn hit_test_resolves_letters() {
-        let kb = VisualKeyboard::qwerty();
-        // 1000x400 surface => 100px per unit-x, 100px per unit-y.
-        // 'q' cap is unit (0,0,1,1) => pixel rect (0,0,100,100); center (50,50).
-        assert_eq!(kb.hit_test(50, 50, 1000, 400).unwrap().action, KeyAction::Char('q'));
-        // Space is unit x 2.5..7.5 on row 3 (y 300..400); center (500, 350).
-        assert_eq!(kb.hit_test(500, 350, 1000, 400).unwrap().action, KeyAction::Space);
-        // Far corner beyond any cap.
-        assert!(kb.hit_test(50, 50, 1000, 400).is_some());
+    fn lower_types_lowercase_upper_types_uppercase() {
+        let kb = VisualKeyboard::new();
+        let q_lower = &kb.caps(LayerKind::LettersLower)[0];
+        let q_upper = &kb.caps(LayerKind::LettersUpper)[0];
+        assert_eq!(q_lower.action, KeyAction::Char('q'));
+        assert_eq!(q_upper.action, KeyAction::Char('Q'));
+        // both show the same uppercase label
+        assert_eq!(q_lower.label, "Q");
     }
 
     #[test]
-    fn space_bar_is_wide() {
-        let kb = VisualKeyboard::qwerty();
-        let space = kb.caps().iter().find(|c| c.action == KeyAction::Space).unwrap();
-        assert_eq!(space.w, 5.0);
+    fn hit_test_resolves_per_layer() {
+        let kb = VisualKeyboard::new();
+        // 1000x400 surface. 'q' cap at unit (0,0) -> center (50,50).
+        let i = kb.hit_index(LayerKind::LettersLower, 50, 50, 1000, 400).unwrap();
+        assert_eq!(kb.caps(LayerKind::LettersLower)[i].action, KeyAction::Char('q'));
+        // Symbols1 top-left is '1'.
+        let j = kb.hit_index(LayerKind::Symbols1, 50, 50, 1000, 400).unwrap();
+        assert_eq!(kb.caps(LayerKind::Symbols1)[j].action, KeyAction::Char('1'));
+        // Space (unit x 2.5..7.5, row 3) on every layer.
+        let s = kb.hit_index(LayerKind::Symbols2, 500, 350, 1000, 400).unwrap();
+        assert_eq!(kb.caps(LayerKind::Symbols2)[s].action, KeyAction::Space);
+    }
+
+    #[test]
+    fn page_switch_keys_exist() {
+        let kb = VisualKeyboard::new();
+        let has = |kind, a| kb.caps(kind).iter().any(|c| c.action == a);
+        assert!(has(LayerKind::LettersLower, KeyAction::ToSymbols1));
+        assert!(has(LayerKind::Symbols1, KeyAction::ToSymbols2));
+        assert!(has(LayerKind::Symbols1, KeyAction::ToLetters));
+        assert!(has(LayerKind::Symbols2, KeyAction::ToSymbols1));
+        assert!(has(LayerKind::Symbols2, KeyAction::ToLetters));
+    }
+
+    #[test]
+    fn every_cap_has_a_renderable_label_or_is_space() {
+        let kb = VisualKeyboard::new();
+        for kind in [
+            LayerKind::LettersLower,
+            LayerKind::LettersUpper,
+            LayerKind::Symbols1,
+            LayerKind::Symbols2,
+        ] {
+            for cap in kb.caps(kind) {
+                if cap.action == KeyAction::Space {
+                    continue;
+                }
+                for ch in cap.label.chars() {
+                    assert!(crate::font::glyph(ch).is_some(), "no glyph for {ch:?} in {kind:?}");
+                }
+            }
+        }
     }
 }

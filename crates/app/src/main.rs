@@ -9,8 +9,26 @@ mod input;
 mod keyboard;
 mod render;
 
-use keyboard::{KeyAction, VisualKeyboard};
+use keyboard::{KeyAction, LayerKind, VisualKeyboard};
 use render::{Canvas, Color};
+
+/// Which base layer the keyboard is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Base {
+    Letters,
+    Symbols1,
+    Symbols2,
+}
+
+/// Shift latch state for the letters layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shift {
+    Off,
+    /// Capitalize the next character, then revert.
+    OneShot,
+    /// Caps lock.
+    Lock,
+}
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -150,13 +168,15 @@ fn main() {
         shm,
         pool,
         layer,
-        keyboard: VisualKeyboard::qwerty(),
+        keyboard: VisualKeyboard::new(),
         width: 0,
         height: KBD_HEIGHT,
         configured: false,
         pointer: None,
         pressed: None,
         exit: false,
+        base: Base::Letters,
+        shift: Shift::Off,
         decoder,
         gesture: Vec::new(),
         gesture_start: None,
@@ -194,9 +214,13 @@ struct App {
     height: u32,
     configured: bool,
     pointer: Option<wl_pointer::WlPointer>,
-    /// Index into `keyboard.caps()` currently held down, for press highlight.
+    /// Index into the current layer's caps currently held down, for highlight.
     pressed: Option<usize>,
     exit: bool,
+
+    // --- input layers ---
+    base: Base,
+    shift: Shift,
 
     // --- gesture decoding (ARCHITECTURE.md §4) ---
     decoder: Decoder,
@@ -285,6 +309,8 @@ impl App {
         let (w, h) = (self.width, self.height);
         let key_h = self.key_height();
         let off = SUGGEST_H as i32;
+        let kind = self.current_kind();
+        let shift_on = self.shift != Shift::Off;
         let stride = w as i32 * 4;
         let (buffer, canvas) = self
             .pool
@@ -311,14 +337,14 @@ impl App {
 
             // Keys, drawn in the area below the suggestion bar.
             let scale = key_label_scale(key_h);
-            for (i, cap) in self.keyboard.caps().iter().enumerate() {
+            for (i, cap) in self.keyboard.caps(kind).iter().enumerate() {
                 let r = self.keyboard.rect_of(cap, w, key_h);
                 // 2px gap between keys; offset by the suggestion bar height.
                 let (kx, ky, kw, kh) = (r.x + 2, r.y + off + 2, r.w - 4, r.h - 4);
-                let pressed = self.pressed == Some(i);
-                let fill = if pressed {
+                let active_shift = cap.action == KeyAction::Shift && shift_on;
+                let fill = if self.pressed == Some(i) || active_shift {
                     COL_KEY_PRESSED
-                } else if matches!(cap.action, KeyAction::Char(c) if c.is_ascii_alphabetic()) {
+                } else if matches!(cap.action, KeyAction::Char(_)) {
                     COL_KEY
                 } else {
                     COL_KEY_FN
@@ -359,6 +385,16 @@ impl App {
         self.height.saturating_sub(SUGGEST_H)
     }
 
+    /// The layer currently displayed, derived from base layer + shift state.
+    fn current_kind(&self) -> LayerKind {
+        match self.base {
+            Base::Letters if self.shift != Shift::Off => LayerKind::LettersUpper,
+            Base::Letters => LayerKind::LettersLower,
+            Base::Symbols1 => LayerKind::Symbols1,
+            Base::Symbols2 => LayerKind::Symbols2,
+        }
+    }
+
     /// Map a surface pixel to decoder keyboard-units. The key area is 10 units
     /// wide and 4 rows tall, so letter-row centers land at y = 0.5/1.5/2.5,
     /// matching the decoder's QWERTY centroids.
@@ -389,9 +425,13 @@ impl App {
         self.gesture_start = Some(Instant::now());
         self.gesture.push((px, py, 0));
         self.pressing = true;
-        self.pressed =
-            self.keyboard
-                .hit_index(px as i32, py as i32 - SUGGEST_H as i32, self.width, self.key_height());
+        self.pressed = self.keyboard.hit_index(
+            self.current_kind(),
+            px as i32,
+            py as i32 - SUGGEST_H as i32,
+            self.width,
+            self.key_height(),
+        );
         self.draw(qh);
     }
 
@@ -417,11 +457,15 @@ impl App {
         }
         self.pressing = false;
 
-        let is_gesture = self.gesture.len() >= 3 && pixel_path_len(&self.gesture) > self.tap_threshold();
+        // Gestures only make sense on the letters layer; elsewhere every press
+        // is a tap.
+        let is_gesture = self.base == Base::Letters
+            && self.gesture.len() >= 3
+            && pixel_path_len(&self.gesture) > self.tap_threshold();
         if is_gesture {
             self.run_gesture();
         } else if let Some(i) = self.pressed {
-            let action = self.keyboard.caps()[i].action;
+            let action = self.keyboard.caps(self.current_kind())[i].action;
             self.handle_action(action);
         }
         self.pressed = None;
@@ -448,9 +492,27 @@ impl App {
         let decode_us = t0.elapsed().as_micros();
         match cands.first() {
             Some(top) => {
-                let word = top.word.clone();
+                // Apply shift to the committed word (sentence-case).
+                let word = if self.shift != Shift::Off {
+                    capitalize(&top.word)
+                } else {
+                    top.word.clone()
+                };
+                if self.shift == Shift::OneShot {
+                    self.shift = Shift::Off;
+                }
                 self.commit_word(&word);
-                self.suggestions = cands.iter().take(4).map(|c| c.word.clone()).collect();
+                self.suggestions = cands
+                    .iter()
+                    .take(4)
+                    .map(|c| {
+                        if word.starts_with(|ch: char| ch.is_uppercase()) {
+                            capitalize(&c.word)
+                        } else {
+                            c.word.clone()
+                        }
+                    })
+                    .collect();
                 let alts: Vec<&String> = self.suggestions.iter().skip(1).collect();
                 println!("gesture -> '{word}'  alternates: {alts:?}  ({decode_us} us)");
             }
@@ -463,9 +525,7 @@ impl App {
         let text = format!("{word} ");
         if !self.commit_text(&text) {
             for ch in text.chars() {
-                if let Some(code) = input::char_to_keycode(ch) {
-                    self.vk_tap(code);
-                }
+                self.vk_type_char(ch);
             }
         }
         self.last_committed = Some(word.to_string());
@@ -506,34 +566,46 @@ impl App {
         Some(self.suggestions[idx].clone())
     }
 
-    /// Inject the result of a key press into the focused application.
+    /// Act on a tapped key.
     ///
-    /// Text (letters, space, punctuation) goes through input-method
+    /// Text (letters, space, punctuation, symbols) goes through input-method
     /// `commit_string` when a field is active, else falls back to synthesized
-    /// keystrokes. Backspace and Enter are always real key events: apps treat
-    /// them as keys, so they correctly delete a selection, repeat, submit forms,
-    /// etc. (`delete_surrounding_text` is reserved for gesture word-replace in
-    /// milestone 4, where we delete a known committed range, not a selection.)
+    /// keystrokes (with Shift for capitals/shifted symbols). Backspace and Enter
+    /// are always real key events. The remaining actions switch layers or latch
+    /// shift; a one-shot shift is consumed after the next character.
     fn handle_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::Char(c) => {
                 let mut buf = [0u8; 4];
                 if !self.commit_text(c.encode_utf8(&mut buf)) {
-                    if let Some(code) = input::char_to_keycode(c) {
-                        self.vk_tap(code);
-                    }
+                    self.vk_type_char(c);
+                }
+                if self.shift == Shift::OneShot {
+                    self.shift = Shift::Off;
                 }
             }
             KeyAction::Space => {
                 if !self.commit_text(" ") {
-                    self.vk_tap(input::char_to_keycode(' ').unwrap());
+                    self.vk_type_char(' ');
                 }
             }
             KeyAction::Backspace => self.vk_tap(input::KEY_BACKSPACE),
             KeyAction::Enter => self.vk_tap(input::KEY_ENTER),
-            KeyAction::Shift | KeyAction::Symbols => {} // not wired in milestone 2
+            KeyAction::Shift => {
+                self.shift = match self.shift {
+                    Shift::Off => Shift::OneShot,
+                    Shift::OneShot => Shift::Lock,
+                    Shift::Lock => Shift::Off,
+                };
+            }
+            KeyAction::ToLetters => self.base = Base::Letters,
+            KeyAction::ToSymbols1 => {
+                self.base = Base::Symbols1;
+                self.shift = Shift::Off;
+            }
+            KeyAction::ToSymbols2 => self.base = Base::Symbols2,
         }
-        print_action(action); // keep the M1 stdout trace for debugging
+        print_action(action); // keep the stdout trace for debugging
     }
 
     /// Commit text via the input-method channel. Returns false if no field is
@@ -558,6 +630,29 @@ impl App {
         vk.key(t, keycode, input::STATE_PRESSED);
         let t = self.next_time();
         vk.key(t, keycode, input::STATE_RELEASED);
+    }
+
+    /// Type one character via the virtual keyboard, holding Shift if the US
+    /// layout requires it (capitals, shifted symbols). Used when no text field
+    /// is active.
+    fn vk_type_char(&mut self, c: char) {
+        let Some((code, shift)) = input::char_to_key(c) else {
+            return;
+        };
+        let Some(vk) = self.virtual_keyboard.clone() else {
+            return;
+        };
+        // xkb Shift modifier mask is bit 0.
+        if shift {
+            vk.modifiers(1, 0, 0, 0);
+        }
+        let t = self.next_time();
+        vk.key(t, code, input::STATE_PRESSED);
+        let t = self.next_time();
+        vk.key(t, code, input::STATE_RELEASED);
+        if shift {
+            vk.modifiers(0, 0, 0, 0);
+        }
     }
 
     fn next_time(&mut self) -> u32 {
@@ -585,6 +680,15 @@ fn key_label_scale(height: u32) -> usize {
     ((row_h / (font::GLYPH_H as u32 * 2)).max(1)).min(6) as usize
 }
 
+/// Uppercase the first character of a word.
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn print_action(action: KeyAction) {
     match action {
         KeyAction::Char(c) => println!("key: '{c}'"),
@@ -592,7 +696,9 @@ fn print_action(action: KeyAction) {
         KeyAction::Backspace => println!("key: BACKSPACE"),
         KeyAction::Enter => println!("key: ENTER"),
         KeyAction::Shift => println!("key: SHIFT"),
-        KeyAction::Symbols => println!("key: SYMBOLS"),
+        KeyAction::ToLetters => println!("key: ABC"),
+        KeyAction::ToSymbols1 => println!("key: SYM1"),
+        KeyAction::ToSymbols2 => println!("key: SYM2"),
     }
 }
 
