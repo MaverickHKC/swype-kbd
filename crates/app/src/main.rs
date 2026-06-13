@@ -215,6 +215,7 @@ fn main() {
         last_committed: None,
         left: String::new(),
         suggest_kind: SuggestKind::None,
+        undo: None,
         _im_mgr: im_mgr,
         input_method,
         im_active: false,
@@ -285,6 +286,10 @@ struct App {
     left: String,
     /// Meaning of the current suggestion-bar entries.
     suggest_kind: SuggestKind,
+    /// If set, the number of trailing characters (a just-committed word plus its
+    /// space) that the very next Backspace removes as a unit — one-tap undo of a
+    /// gesture/completion/replacement. Any other tapped key disarms it.
+    undo: Option<u32>,
 
     // --- text injection (ARCHITECTURE.md §3.3) ---
     _im_mgr: Option<ZwpInputMethodManagerV2>,
@@ -654,6 +659,8 @@ impl App {
                     })
                     .collect();
                 self.suggest_kind = SuggestKind::GestureAlternates;
+                // A backspace now removes the whole swiped word in one tap.
+                self.undo = Some(word.len() as u32 + 1);
                 let alts: Vec<&String> = self.suggestions.iter().skip(1).collect();
                 println!("gesture -> '{word}'  alternates: {alts:?}  ({decode_us} us)");
             }
@@ -682,22 +689,11 @@ impl App {
         // The word being replaced is the one the user is rejecting.
         let rejected = self.last_committed.clone();
         if let Some(prev) = &rejected {
-            let del = (prev.len() + 1) as u32; // +1 for the trailing space (ASCII)
-            if self.im_active {
-                if let Some(im) = &self.input_method {
-                    im.delete_surrounding_text(del, 0);
-                    im.commit(self.im_serial);
-                }
-            } else {
-                for _ in 0..del {
-                    self.vk_tap(input::KEY_BACKSPACE);
-                }
-            }
-            for _ in 0..del {
-                self.left.pop();
-            }
+            self.delete_n(prev.len() as u32 + 1); // +1 for the trailing space (ASCII)
         }
         self.commit_word(word);
+        // A backspace now undoes this replacement (removes the new word).
+        self.undo = Some(word.len() as u32 + 1);
         // Move the chosen word into slot 0 so it shows as selected.
         if let Some(pos) = self.suggestions.iter().position(|w| w == word) {
             self.suggestions.swap(0, pos);
@@ -754,6 +750,9 @@ impl App {
     /// are always real key events. The remaining actions switch layers or latch
     /// shift; a one-shot shift is consumed after the next character.
     fn handle_action(&mut self, action: KeyAction) {
+        // Any tapped key consumes the one-tap undo arming; only Backspace acts on
+        // it (below). After this, a second backspace deletes normally.
+        let undo = self.undo.take();
         match action {
             KeyAction::Char(c) => self.type_key_char(c),
             KeyAction::Space => {
@@ -764,8 +763,19 @@ impl App {
                 self.auto_space = false;
             }
             KeyAction::Backspace => {
-                self.vk_tap(input::KEY_BACKSPACE);
-                self.left.pop();
+                if let Some(n) = undo {
+                    // Undo the just-committed word: remove it and its trailing
+                    // space as a unit instead of one letter at a time, and drop
+                    // the now-stale suggestion bar.
+                    self.delete_n(n);
+                    self.suggestions.clear();
+                    self.suggest_kind = SuggestKind::None;
+                    self.last_committed = None;
+                    println!("undo committed word ({n} chars)");
+                } else {
+                    self.vk_tap(input::KEY_BACKSPACE);
+                    self.left.pop();
+                }
                 self.auto_space = false;
                 self.pending_cap = false;
             }
@@ -879,6 +889,8 @@ impl App {
         self.type_char(' ');
         self.auto_space = true;
         self.last_committed = Some(word.to_ascii_lowercase());
+        // A backspace now undoes the completion, restoring the typed prefix.
+        self.undo = Some(suffix.len() as u32 + 1);
         self.refresh_completions();
         println!("complete -> '{word}'");
     }
@@ -899,6 +911,28 @@ impl App {
             self.vk_type_char(c);
         }
         self.push_left(c);
+    }
+
+    /// Delete the `n` characters before the cursor via whichever channel is live,
+    /// keeping the `left` mirror in sync. Dictionary words and the auto space are
+    /// ASCII, so the char count equals the input-method byte length.
+    fn delete_n(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        if self.im_active {
+            if let Some(im) = &self.input_method {
+                im.delete_surrounding_text(n, 0);
+                im.commit(self.im_serial);
+            }
+        } else {
+            for _ in 0..n {
+                self.vk_tap(input::KEY_BACKSPACE);
+            }
+        }
+        for _ in 0..n {
+            self.left.pop();
+        }
     }
 
     /// Delete one character before the cursor via whichever channel is live, and
