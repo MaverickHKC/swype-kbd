@@ -28,7 +28,11 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestone history.
   Words you type that aren't in the dictionary join a **personal dictionary**
   after a few uses, becoming swipeable and completable like any other word.
   All of it persists under `$XDG_STATE_HOME/swype-kbd/` (`learned.txt`,
-  `personal.txt`, `bigrams.txt`).
+  `personal.txt`, `bigrams.txt`), written `0600` (owner-only).
+- **Privacy-aware** — text typed into **password / PIN / sensitive fields**
+  (per the input-method `content_type`) is never learned or persisted. For a
+  global opt-out regardless of field tagging, run with **`--no-learn`**, which
+  disables personalization entirely and reads/writes no state files.
 - **One-tap undo** — Backspace right after a committed word removes it whole.
 - **Polished UI** — anti-aliased TrueType labels, rounded keys with depth, a key
   pop-up preview, and a glowing gesture trail, all from a dependency-light
@@ -70,6 +74,16 @@ with Ctrl-C.
 The dictionary is found via `$SWYPE_DICT`, then a path next to the binary, then
 `./data/`; a small embedded list is the fallback so the binary also works
 standalone.
+
+### Options
+
+```
+--always-on   Stay docked even when no field is focused (default: auto-hide to a
+              slim tap handle, popping up on typing context).
+--no-learn    Disable all personalization — no state files are read or written.
+              (Password/sensitive fields are excluded automatically regardless.)
+--help, -h    Full usage.
+```
 
 ## Layout
 

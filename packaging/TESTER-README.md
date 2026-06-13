@@ -34,8 +34,10 @@ To stop it: `pkill -x swype-kbd` (or Ctrl-C in the terminal you launched it from
 - **Tap typing** — tap keys individually; the bar shows word completions.
 - **It personalizes** — words you use get more likely; tap-typed words not in the
   dictionary get added after a few uses; after you commit a word, the bar predicts
-  a likely next word. State persists in
-  `${XDG_STATE_HOME:-~/.local/state}/swype-kbd/`.
+  a likely next word. State persists (owner-only, `0600`) in
+  `${XDG_STATE_HOME:-~/.local/state}/swype-kbd/`. Text typed into password /
+  sensitive fields is never learned or saved. To disable personalization entirely,
+  launch with `./run.sh --no-learn` (no state files are read or written).
 - **Undo** — Backspace right after a committed word removes the whole word.
 
 ## Troubleshooting

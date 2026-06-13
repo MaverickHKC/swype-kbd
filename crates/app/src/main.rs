@@ -131,12 +131,15 @@ fn main() {
         println!(
             "swype-kbd — Wayland swipe-typing on-screen keyboard\n\
              \n\
-             USAGE:\n    swype-kbd [--always-on]\n\
+             USAGE:\n    swype-kbd [--always-on] [--no-learn]\n\
              \n\
              OPTIONS:\n\
              \x20   --always-on   Keep the keyboard docked even when no text field is\n\
              \x20                 focused. Default: auto-hide to a slim tap handle when\n\
              \x20                 nothing is focused, and pop back up on typing context.\n\
+             \x20   --no-learn    Disable all personalization: never read or write the\n\
+             \x20                 learned/personal/next-word files. (Password and other\n\
+             \x20                 sensitive fields are always excluded regardless.)\n\
              \x20   --help, -h    Show this help.\n\
              \n\
              ENV:\n\
@@ -147,6 +150,10 @@ fn main() {
     // Auto-hide (collapse to a handle when no field is focused) is the default;
     // --always-on restores the old behavior of staying fully docked.
     let auto_hide = !args.iter().any(|a| a == "--always-on");
+    // --no-learn is a global privacy kill-switch: no learning, and no state files
+    // are read or written at all (belt-and-suspenders for apps that fail to tag
+    // their password fields, since field detection depends on the app).
+    let no_learn = args.iter().any(|a| a == "--no-learn");
 
     let conn = Connection::connect_to_env()
         .expect("failed to connect to a Wayland display (is WAYLAND_DISPLAY set?)");
@@ -224,7 +231,12 @@ fn main() {
     // they're swipeable + completable from startup.
     let personal_seed = decoder.typical_ln_freq();
     let personal_path = personal_path();
-    let personal = load_personal(&personal_path);
+    let learned_path = learned_path();
+    let bigrams_path = bigrams_path();
+    // --no-learn starts a stateless session: load nothing (and, since the save
+    // paths are guarded, write nothing). Paths are still kept so the field types
+    // line up, but the files are never touched.
+    let personal = if no_learn { HashMap::new() } else { load_personal(&personal_path) };
     let mut promoted = 0usize;
     for (word, &count) in &personal {
         if count >= PROMOTE_THRESHOLD && decoder.add_word(word, personal_seed) {
@@ -233,13 +245,11 @@ fn main() {
     }
     // Apply persisted per-user learning on top of the base frequencies (this
     // also lifts promoted personal words by their accumulated passive boosts).
-    let learned_path = learned_path();
-    let learned = load_learned(&learned_path);
+    let learned = if no_learn { HashMap::new() } else { load_learned(&learned_path) };
     for (word, boost) in &learned {
         decoder.learn(word, *boost);
     }
-    let bigrams_path = bigrams_path();
-    let bigrams = load_bigrams(&bigrams_path);
+    let bigrams = if no_learn { HashMap::new() } else { load_bigrams(&bigrams_path) };
     eprintln!(
         "swype-kbd: decoder ready — {} word templates from {} (built in {} ms); \
          {} learned, {} personal ({} active), {} prediction contexts",
@@ -251,6 +261,9 @@ fn main() {
         promoted,
         bigrams.len(),
     );
+    if no_learn {
+        eprintln!("swype-kbd: --no-learn set; personalization disabled, no state files read or written");
+    }
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -267,6 +280,7 @@ fn main() {
         configured: false,
         auto_hide,
         expanded: !auto_hide,
+        no_learn,
         pointer: None,
         touch: None,
         active_touch: None,
@@ -344,6 +358,9 @@ struct App {
     /// Current visibility: `true` = full keyboard, `false` = collapsed handle.
     /// Always `true` when `auto_hide` is off.
     expanded: bool,
+    /// Global privacy kill-switch (`--no-learn`): when set, the keyboard never
+    /// learns or persists anything, regardless of field type.
+    no_learn: bool,
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
     /// The touch-point id currently driving a press/gesture (single-touch).
@@ -1137,8 +1154,14 @@ impl App {
     /// Gently reward a word the user actually used (typed, swiped, or
     /// completed), so genuinely-used vocabulary rises over time. Passive
     /// learning: shares the correction clamp and persistence, smaller delta.
+    /// Whether learning/persistence is currently suppressed — either globally
+    /// (`--no-learn`) or because the focused field is a password/sensitive field.
+    fn learning_off(&self) -> bool {
+        self.no_learn || self.sensitive_field
+    }
+
     fn reward_use(&mut self, word: &str) {
-        if self.sensitive_field {
+        if self.learning_off() {
             return;
         }
         self.adjust_learning(word, PASSIVE_DELTA);
@@ -1165,7 +1188,7 @@ impl App {
     /// it once it crosses the threshold — after which it decodes and completes
     /// like any other word.
     fn count_new_word(&mut self, key: &str) {
-        if self.sensitive_field {
+        if self.learning_off() {
             return;
         }
         let count = self.personal.entry(key.to_string()).or_insert(0);
@@ -1214,6 +1237,9 @@ impl App {
 
     /// Increment the (prev -> next) bigram count and persist.
     fn bump_bigram(&mut self, prev: &str, next: &str) {
+        if self.learning_off() {
+            return;
+        }
         let succ = self.bigrams.entry(prev.to_string()).or_default();
         *succ.entry(next.to_string()).or_insert(0) += 1;
         save_bigrams(&self.bigrams_path, &self.bigrams);
