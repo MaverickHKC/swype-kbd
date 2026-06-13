@@ -63,6 +63,56 @@ pub fn sample_stroke(word: &str, layout: &KeyboardLayout, n_points: usize) -> Op
     Some(rs)
 }
 
+/// Curvature floor (1/key-unit) so straight segments move at a finite top speed
+/// rather than infinitely fast. Larger → a flatter speed profile.
+const KAPPA_FLOOR: f32 = 0.15;
+
+/// Re-stamp `trace` with a curvature-aware velocity profile. Tangential speed
+/// follows the 2/3 power law of human movement (v ∝ curvature^(-1/3)), so the
+/// swipe slows through the sharp corners at letter centroids and accelerates on
+/// the straights between them — the dwell pattern real swipes show and the
+/// velocity-weighted decoder keys on. Geometry is untouched; only `t` changes,
+/// and total duration is rescaled to match `sample_stroke`'s ~120 ms/key-unit so
+/// absolute times stay realistic.
+pub fn stamp_velocity(trace: &Trace) -> Trace {
+    let pts = trace.points.clone();
+    let n = pts.len();
+    if n < 3 {
+        return Trace::from_points(pts);
+    }
+    // Per-point speed from the local turning angle (a curvature proxy, dθ/ds).
+    let top_speed = KAPPA_FLOOR.powf(-1.0 / 3.0);
+    let speed: Vec<f32> = (0..n)
+        .map(|i| {
+            if i == 0 || i == n - 1 {
+                return top_speed; // endpoints: no corner, full speed
+            }
+            let (ax, ay) = (pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+            let (bx, by) = (pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+            let la = (ax * ax + ay * ay).sqrt().max(1e-6);
+            let lb = (bx * bx + by * by).sqrt().max(1e-6);
+            let cos = ((ax * bx + ay * by) / (la * lb)).clamp(-1.0, 1.0);
+            let kappa = cos.acos() / (0.5 * (la + lb));
+            (kappa + KAPPA_FLOOR).powf(-1.0 / 3.0)
+        })
+        .collect();
+    // Integrate dt = ds / v_avg, then rescale to the target total duration.
+    let mut acc = vec![0.0f32; n];
+    for i in 1..n {
+        let (dx, dy) = (pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+        let ds = (dx * dx + dy * dy).sqrt();
+        let v = 0.5 * (speed[i - 1] + speed[i]);
+        acc[i] = acc[i - 1] + ds / v.max(1e-6);
+    }
+    let target = trace.path_length() * 120.0;
+    let scale = if acc[n - 1] > 1e-6 { target / acc[n - 1] } else { 0.0 };
+    let mut out = pts;
+    for (i, p) in out.iter_mut().enumerate() {
+        p.t = (acc[i] * scale) as u32;
+    }
+    Trace::from_points(out)
+}
+
 /// Add per-point Gaussian noise of standard deviation `sigma` (in key units).
 pub fn jitter(trace: &Trace, rng: &mut Rng, sigma: f32) -> Trace {
     Trace::from_points(
@@ -118,6 +168,9 @@ pub fn human_like(
     let stroke = sample_stroke(word, layout, 48)?;
     let stroke = overshoot(&stroke, 0.18 * level);
     let stroke = smooth(&stroke, (2.0 * level).round() as usize);
+    // Stamp a realistic velocity profile on the clean path before jittering, so
+    // the timing reflects the intended dwell-at-corners, not the noise.
+    let stroke = stamp_velocity(&stroke);
     let stroke = jitter(&stroke, rng, 0.18 * level);
     Some(stroke)
 }
@@ -159,6 +212,26 @@ mod tests {
         let sm = smooth(&s, 3);
         assert_eq!(s.first().unwrap().x, sm.first().unwrap().x);
         assert_eq!(s.last().unwrap().y, sm.last().unwrap().y);
+    }
+
+    #[test]
+    fn velocity_slows_at_corners() {
+        // An L-shape: straight along x, a sharp 90° turn, straight along y. All
+        // segments are unit length, so timing differences come only from speed.
+        let t = Trace::from_points(vec![
+            Point::new(0.0, 0.0, 0),
+            Point::new(1.0, 0.0, 0),
+            Point::new(2.0, 0.0, 0),
+            Point::new(2.0, 1.0, 0),
+            Point::new(2.0, 2.0, 0),
+        ]);
+        let v = stamp_velocity(&t);
+        let dt = |i: usize| v.points[i + 1].t as i64 - v.points[i - 1].t as i64;
+        // The corner (index 2) is traversed slower than a straight stretch.
+        assert!(dt(2) > dt(1), "corner dt {} should exceed straight dt {}", dt(2), dt(1));
+        // Times are monotonic and geometry is untouched.
+        assert!(v.points.windows(2).all(|w| w[1].t >= w[0].t));
+        assert_eq!((v.points[2].x, v.points[2].y), (2.0, 0.0));
     }
 
     #[test]

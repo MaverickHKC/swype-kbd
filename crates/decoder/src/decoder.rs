@@ -29,6 +29,12 @@ pub struct DecoderParams {
     /// Passes of endpoint-preserving moving-average smoothing applied to the
     /// captured trace before resampling, to absorb finger/pointer jitter.
     pub smooth_passes: usize,
+    /// Velocity weighting of the location channel, in `[0, 1]`. Real swipes slow
+    /// down through the keys they mean to hit and speed across the gaps; with the
+    /// trace resampled equidistantly in space, the time between samples measures
+    /// that dwell. At 0 every point counts equally (plain mean); at 1 each point
+    /// is weighted by its dwell time, so deliberate points dominate the match.
+    pub vel_weight: f32,
     /// Maximum candidates returned (top-1 plus alternates).
     pub max_candidates: usize,
 }
@@ -50,6 +56,12 @@ impl Default for DecoderParams {
             // smoothing only rounds corners. Left tunable for real-device input,
             // which carries spikier noise the synthetic model doesn't capture.
             smooth_passes: 0,
+            // A modest dwell weighting: on the realistic synthetic velocity
+            // profile (`vel_sweep`) 0.5 never regresses and edges top-1 up,
+            // while 1.0 over-weights and hurts clean swipes. Real fingers dwell
+            // on keys more sharply than the conservative synthetic model, so the
+            // on-device gain should exceed the synthetic margin.
+            vel_weight: 0.5,
             max_candidates: 8,
         }
     }
@@ -184,6 +196,7 @@ impl Decoder {
         };
         let loc_in: Vec<[f32; 2]> = rs.points.iter().map(|pt| [pt.x, pt.y]).collect();
         let shape_in = normalize_shape(&rs);
+        let weights = dwell_weights(&rs, p.vel_weight);
         let start = loc_in[0];
         let end = loc_in[loc_in.len() - 1];
         let r2 = p.prune_radius * p.prune_radius;
@@ -203,7 +216,7 @@ impl Decoder {
                 continue;
             }
             let shape_dist = mean_dist(&shape_in, &t.shape);
-            let loc_dist = mean_dist(&loc_in, &t.loc);
+            let loc_dist = weighted_mean_dist(&loc_in, &t.loc, &weights);
             let score = -(shape_dist * shape_dist) * shape_k
                 - (loc_dist * loc_dist) * loc_k
                 - (d_start + d_end) * end_k
@@ -241,6 +254,55 @@ fn mean_dist(a: &[[f32; 2]], b: &[[f32; 2]]) -> f32 {
     sum / n
 }
 
+/// Weighted mean Euclidean distance between two equal-length point sequences.
+/// With all-equal weights this is exactly [`mean_dist`].
+fn weighted_mean_dist(a: &[[f32; 2]], b: &[[f32; 2]], w: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), w.len());
+    let mut num = 0.0f32;
+    let mut den = 0.0f32;
+    for ((p, q), &wi) in a.iter().zip(b).zip(w) {
+        num += wi * dist2(*p, *q).sqrt();
+        den += wi;
+    }
+    num / den.max(EPS)
+}
+
+/// Per-point weights for the location channel from a trace resampled
+/// equidistantly in space: the local time between samples is the dwell time on
+/// that fixed arc step, so slow (deliberate) points get more weight. `vel_weight`
+/// in `[0, 1]` blends from uniform (0) to fully dwell-proportional (1). Falls
+/// back to uniform when there is no usable timing (templates, zero-duration).
+fn dwell_weights(rs: &Trace, vel_weight: f32) -> Vec<f32> {
+    let n = rs.points.len();
+    if vel_weight <= 0.0 || n < 2 {
+        return vec![1.0; n];
+    }
+    let t: Vec<f32> = rs.points.iter().map(|p| p.t as f32).collect();
+    if t[n - 1] - t[0] <= EPS {
+        return vec![1.0; n];
+    }
+    // Time per arc-step around the point (the centered window spans 2 steps in
+    // the interior, 1 at the ends). Dividing by the step count yields inverse
+    // speed, so a constant-speed trace weights uniformly and only genuine
+    // slow-downs stand out — no spurious endpoint bias from the half-window.
+    let dwell: Vec<f32> = (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(1);
+            let hi = (i + 1).min(n - 1);
+            (t[hi] - t[lo]).max(0.0) / (hi - lo) as f32
+        })
+        .collect();
+    let mean = dwell.iter().sum::<f32>() / n as f32;
+    if mean <= EPS {
+        return vec![1.0; n];
+    }
+    dwell
+        .iter()
+        .map(|d| (1.0 - vel_weight) + vel_weight * (d / mean))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +311,33 @@ mod tests {
 
     fn decoder() -> Decoder {
         Decoder::with_defaults(KeyboardLayout::qwerty(), Dictionary::english())
+    }
+
+    #[test]
+    fn dwell_weights_are_uniform_without_velocity_signal_or_when_off() {
+        use crate::trace::Point;
+        // Constant-speed trace (linear timestamps): no dwell signal -> uniform.
+        let rs = Trace::from_points(
+            (0..5).map(|i| Point::new(i as f32, 0.0, (i * 10) as u32)).collect(),
+        );
+        let w = dwell_weights(&rs, 0.5);
+        assert!(w.iter().all(|&x| (x - 1.0).abs() < 1e-5), "uniform speed -> {w:?}");
+        // A slow first segment (100 ms) then a fast one (10 ms), equal spacing.
+        let rs2 = Trace::from_points(vec![
+            Point::new(0.0, 0.0, 0),
+            Point::new(1.0, 0.0, 100),
+            Point::new(2.0, 0.0, 110),
+        ]);
+        // vel_weight 0 is always uniform, even with a dwell.
+        assert_eq!(dwell_weights(&rs2, 0.0), vec![1.0; 3]);
+        // With weighting on, weight tracks slowness: highest where the bordering
+        // segments are slow, lowest in the fast stretch.
+        let w2 = dwell_weights(&rs2, 1.0);
+        assert!(w2[0] > w2[1] && w2[1] > w2[2], "weight should follow slowness: {w2:?}");
+        // weighted_mean_dist reduces to mean_dist under uniform weights.
+        let a = [[0.0, 0.0], [1.0, 0.0]];
+        let b = [[0.0, 1.0], [1.0, 2.0]];
+        assert!((weighted_mean_dist(&a, &b, &[1.0, 1.0]) - mean_dist(&a, &b)).abs() < 1e-6);
     }
 
     #[test]
@@ -344,6 +433,47 @@ mod tests {
             }
         }
         (top1 as f32 / total as f32, top3 as f32 / total as f32, total)
+    }
+
+    /// Velocity-weighting sweep behind `vel_weight`, on the curvature-aware
+    /// synthetic velocity profile (`synth::stamp_velocity`). Run with:
+    /// `cargo test -p swype-decoder vel_sweep -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn vel_sweep() {
+        let kb = KeyboardLayout::qwerty();
+        // A harder set than `measure`: longer words (≥5 letters) have more
+        // interior keys to dwell on and are more confusable, so the top-150
+        // common-word ceiling doesn't hide the effect.
+        let words: Vec<String> = Dictionary::english()
+            .words()
+            .iter()
+            .filter(|w| w.chars().count() >= 5 && ideal_trace(w, &kb).is_some())
+            .take(250)
+            .cloned()
+            .collect();
+        for level in [0.7f32, 1.0] {
+            for vel_weight in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+                let params = DecoderParams {
+                    vel_weight,
+                    ..Default::default()
+                };
+                let dec = Decoder::new(kb.clone(), Dictionary::english(), params);
+                let mut rng = Rng::new(0xC0FFEE_1234);
+                let (mut top1, mut top3, mut total) = (0u32, 0u32, 0u32);
+                for w in &words {
+                    for _ in 0..8 {
+                        let trace = human_like(w, &kb, &mut rng, level).unwrap();
+                        let cands = dec.decode(&trace);
+                        total += 1;
+                        top1 += cands.first().map_or(0, |c| (&c.word == w) as u32);
+                        top3 += cands.iter().take(3).any(|c| &c.word == w) as u32;
+                    }
+                }
+                let (p1, p3) = (top1 as f32 / total as f32, top3 as f32 / total as f32);
+                println!("level={level:.2} vel={vel_weight:.2} -> top1={p1:.3} top3={p3:.3} (n={total})");
+            }
+        }
     }
 
     /// Trace-smoothing sweep behind the off-by-default `smooth_passes`. Run with:
