@@ -89,6 +89,9 @@ const SUGGEST_H: u32 = 48;
 /// A press that travels less than this fraction of a key width is a tap, not a
 /// gesture.
 const TAP_FRACTION: f32 = 0.45;
+/// Smoothing passes applied to the rendered gesture trail (purely cosmetic; the
+/// decoder smooths separately via `DecoderParams::smooth_passes`).
+const TRAIL_SMOOTH_PASSES: usize = 2;
 
 // --- palette ---------------------------------------------------------------
 const COL_BG: Color = Color::rgb(0x1a, 0x1c, 0x22);
@@ -474,14 +477,21 @@ impl App {
                 }
             }
 
-            // Live gesture trail.
+            // Live gesture trail, smoothed so finger jitter doesn't render as a
+            // ragged line. Endpoints are held fixed, so the trail still tracks
+            // the fingertip exactly. Cheap: gestures are at most a few hundred
+            // points and this runs only while pressing.
             if self.pressing && self.gesture.len() >= 2 {
-                for win in self.gesture.windows(2) {
+                let raw = Trace::from_points(
+                    self.gesture.iter().map(|&(x, y, t)| Point::new(x, y, t)).collect(),
+                );
+                let trail = raw.smoothed(TRAIL_SMOOTH_PASSES);
+                for win in trail.points.windows(2) {
                     cv.draw_line(
-                        win[0].0 as i32,
-                        win[0].1 as i32,
-                        win[1].0 as i32,
-                        win[1].1 as i32,
+                        win[0].x as i32,
+                        win[0].y as i32,
+                        win[1].x as i32,
+                        win[1].y as i32,
                         4,
                         COL_TRAIL,
                     );

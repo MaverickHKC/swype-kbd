@@ -129,6 +129,28 @@ impl Trace {
         Trace::from_points(out)
     }
 
+    /// Denoise the path with `passes` of an endpoint-preserving 3-tap weighted
+    /// average (kernel `[0.25, 0.5, 0.25]`). Real touch/pointer input is jittery;
+    /// a light smoothing before resampling steadies both the decode and the
+    /// rendered trail. The center-weighted kernel rounds high-frequency tremor
+    /// while keeping the deliberate corners (key visits) the decoder leans on,
+    /// and the fixed endpoints keep the start/end the prune gate depends on.
+    /// `passes == 0` returns a no-op clone.
+    pub fn smoothed(&self, passes: usize) -> Trace {
+        let mut pts = self.points.clone();
+        for _ in 0..passes {
+            if pts.len() < 3 {
+                break;
+            }
+            let prev = pts.clone();
+            for i in 1..prev.len() - 1 {
+                pts[i].x = 0.25 * prev[i - 1].x + 0.5 * prev[i].x + 0.25 * prev[i + 1].x;
+                pts[i].y = 0.25 * prev[i - 1].y + 0.5 * prev[i].y + 0.25 * prev[i + 1].y;
+            }
+        }
+        Trace::from_points(pts)
+    }
+
     /// Centroid (mean position) of all points.
     pub fn centroid(&self) -> (f32, f32) {
         if self.points.is_empty() {
@@ -196,6 +218,26 @@ mod tests {
         let r = t.resample(29);
         // Resampled polyline length should match the original closely.
         assert!((r.path_length() - 7.0).abs() < 1e-2, "len {}", r.path_length());
+    }
+
+    #[test]
+    fn smoothed_fixes_endpoints_and_reduces_a_spike() {
+        // A straight line with one point spiked off-axis.
+        let t = Trace::from_points(vec![pt(0.0, 0.0), pt(1.0, 5.0), pt(2.0, 0.0), pt(3.0, 0.0)]);
+        let s = t.smoothed(1);
+        // Endpoints are untouched.
+        assert_eq!(s.first().unwrap(), pt(0.0, 0.0));
+        assert_eq!(s.last().unwrap(), pt(3.0, 0.0));
+        // The spike is pulled toward its neighbours (0.25*0 + 0.5*5 + 0.25*0).
+        assert!((s.points[1].y - 2.5).abs() < 1e-5, "y = {}", s.points[1].y);
+        // x of interior points is preserved on an evenly-spaced line.
+        assert!((s.points[1].x - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn smoothed_zero_passes_is_identity() {
+        let t = Trace::from_points(vec![pt(0.0, 0.0), pt(1.0, 5.0), pt(2.0, 0.0)]);
+        assert_eq!(t.smoothed(0), t);
     }
 
     #[test]

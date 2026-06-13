@@ -26,6 +26,9 @@ pub struct DecoderParams {
     pub beta: f32,
     /// Pruning radius (keyboard units) for the start/end gate.
     pub prune_radius: f32,
+    /// Passes of endpoint-preserving moving-average smoothing applied to the
+    /// captured trace before resampling, to absorb finger/pointer jitter.
+    pub smooth_passes: usize,
     /// Maximum candidates returned (top-1 plus alternates).
     pub max_candidates: usize,
 }
@@ -42,6 +45,11 @@ impl Default for DecoderParams {
             end_sigma: 0.45,
             beta: 0.25,
             prune_radius: 1.8,
+            // Off by default: the synthetic harness (`smooth_sweep`) shows the
+            // Gaussian channels already absorb mild jitter, so decode-side
+            // smoothing only rounds corners. Left tunable for real-device input,
+            // which carries spikier noise the synthetic model doesn't capture.
+            smooth_passes: 0,
             max_candidates: 8,
         }
     }
@@ -169,7 +177,11 @@ impl Decoder {
             return Vec::new();
         }
         let p = &self.params;
-        let rs = input.resample(p.n);
+        let rs = if p.smooth_passes > 0 {
+            input.smoothed(p.smooth_passes).resample(p.n)
+        } else {
+            input.resample(p.n)
+        };
         let loc_in: Vec<[f32; 2]> = rs.points.iter().map(|pt| [pt.x, pt.y]).collect();
         let shape_in = normalize_shape(&rs);
         let start = loc_in[0];
@@ -332,6 +344,28 @@ mod tests {
             }
         }
         (top1 as f32 / total as f32, top3 as f32 / total as f32, total)
+    }
+
+    /// Trace-smoothing sweep behind the off-by-default `smooth_passes`. Run with:
+    /// `cargo test -p swype-decoder smooth_sweep -- --ignored --nocapture`.
+    /// On the synthetic harness more passes only cost accuracy (the Gaussian
+    /// channels already absorb the jitter); kept to re-measure against spikier
+    /// real-device captures before enabling it.
+    #[test]
+    #[ignore]
+    fn smooth_sweep() {
+        let kb = KeyboardLayout::qwerty();
+        for level in [0.45f32, 0.7, 1.0] {
+            for smooth_passes in [0usize, 1, 2, 3] {
+                let params = DecoderParams {
+                    smooth_passes,
+                    ..Default::default()
+                };
+                let dec = Decoder::new(kb.clone(), Dictionary::english(), params);
+                let (p1, p3, _) = measure(&dec, level, 6, 0xC0FFEE_1234);
+                println!("level={level:.2} smooth={smooth_passes} -> top1={p1:.3} top3={p3:.3}");
+            }
+        }
     }
 
     /// Reproducible parameter sweep. Run with:
