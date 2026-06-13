@@ -148,6 +148,44 @@ impl Decoder {
             .map(|&i| self.templates[i].ln_freq)
     }
 
+    /// Add a runtime word so it becomes gestureable and completable — a
+    /// personal-dictionary entry. `ln_freq` is its starting prior on the same
+    /// scale as the dictionary's weights (see [`Decoder::typical_ln_freq`]).
+    /// Returns false if the word is already known or cannot be gestured (fewer
+    /// than two layout letters, e.g. a single letter or a repeated one).
+    pub fn add_word(&mut self, word: &str, ln_freq: f32) -> bool {
+        let key = word.trim().to_ascii_lowercase();
+        if key.is_empty() || self.index.contains_key(&key) {
+            return false;
+        }
+        // Build the template against the index the dictionary push *will* assign,
+        // but only commit the push once we know the word is actually gestureable.
+        let word_index = self.dict.len();
+        let Some(t) = Template::build(word_index, &key, ln_freq, &self.layout, self.params.n)
+        else {
+            return false;
+        };
+        self.dict.push(&key, ln_freq);
+        let ti = self.templates.len();
+        self.templates.push(t);
+        self.index.insert(key, ti);
+        true
+    }
+
+    /// A representative "fairly common word" log-frequency for this dictionary:
+    /// the 80th percentile of the template weights. Used to seed personal words
+    /// at a sensible prior regardless of the dictionary's absolute frequency
+    /// scale (the embedded Zipf list and the real count list differ by an order
+    /// of magnitude). Returns 0.0 for an empty decoder.
+    pub fn typical_ln_freq(&self) -> f32 {
+        if self.templates.is_empty() {
+            return 0.0;
+        }
+        let mut v: Vec<f32> = self.templates.iter().map(|t| t.ln_freq).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[(v.len() * 4 / 5).min(v.len() - 1)]
+    }
+
     /// Adjust a word's log-frequency prior by `delta` (per-user learning).
     /// Returns true if the word has a template. The change affects all future
     /// `decode` calls; persistence is the caller's responsibility.
@@ -367,6 +405,45 @@ mod tests {
         assert_eq!(after[0].word, alt, "boosted word should now rank first");
         // Unknown words are a no-op.
         assert!(!dec.learn("zzzzqx", 1.0));
+    }
+
+    #[test]
+    fn add_word_makes_a_new_word_decodeable_and_completable() {
+        let kb = KeyboardLayout::qwerty();
+        let mut dec = decoder();
+        // A made-up name that isn't in the embedded list.
+        assert!(!dec.contains("zane"));
+        assert!(dec.complete("zan", 5).is_empty());
+        // Seed it well above typical so it wins its shape cleanly.
+        let seed = dec.typical_ln_freq() + 4.0;
+        assert!(dec.add_word("zane", seed));
+        assert!(dec.contains("zane"));
+        // Now swipeable: an ideal trace decodes to it...
+        let trace = sample_stroke("zane", &kb, 64).unwrap();
+        assert_eq!(dec.decode(&trace)[0].word, "zane");
+        // ...and completable.
+        assert!(dec.complete("zan", 5).contains(&"zane".to_string()));
+        // Re-adding is a no-op; ungestureable words are rejected.
+        assert!(!dec.add_word("zane", seed));
+        assert!(!dec.add_word("a", seed)); // single letter
+        assert!(!dec.add_word("oo", seed)); // repeated letter -> zero-length path
+    }
+
+    #[test]
+    fn typical_ln_freq_sits_inside_the_weight_range() {
+        let dec = decoder();
+        let typ = dec.typical_ln_freq();
+        let max = (0..dec.templates_len())
+            .map(|i| dec.templates[i].ln_freq)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min = (0..dec.templates_len())
+            .map(|i| dec.templates[i].ln_freq)
+            .fold(f32::INFINITY, f32::min);
+        assert!(typ <= max && typ >= min, "typical {typ} outside [{min}, {max}]");
+        // 80th percentile is on the frequent side: above the median.
+        let mut v: Vec<f32> = (0..dec.templates_len()).map(|i| dec.templates[i].ln_freq).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        assert!(typ >= v[v.len() / 2]);
     }
 
     #[test]

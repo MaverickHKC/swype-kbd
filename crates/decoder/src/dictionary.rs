@@ -101,6 +101,17 @@ impl Dictionary {
         &self.words
     }
 
+    /// Append a word with an explicit log-frequency weight, returning its new
+    /// index. Used for personal-dictionary entries learned at runtime. The word
+    /// is lowercased; the caller is responsible for not duplicating an existing
+    /// word (use [`Decoder::add_word`](crate::Decoder::add_word), which checks).
+    pub fn push(&mut self, word: &str, ln_freq: f32) -> usize {
+        let i = self.words.len();
+        self.words.push(word.trim().to_ascii_lowercase());
+        self.ln_freq.push(ln_freq);
+        i
+    }
+
     /// Rank (index) of a word, if present. Linear scan — for tests/setup only.
     pub fn rank_of(&self, word: &str) -> Option<usize> {
         let w = word.to_ascii_lowercase();
