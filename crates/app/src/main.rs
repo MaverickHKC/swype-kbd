@@ -174,7 +174,9 @@ fn main() {
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
 
-    let pool = SlotPool::new((1920 * KBD_HEIGHT * 4) as usize, &shm)
+    // Sized for a full-width 2x-scale keyboard buffer; the pool grows on demand
+    // for anything larger (wider outputs, higher scales).
+    let pool = SlotPool::new((3840 * KBD_HEIGHT * 2 * 4) as usize, &shm)
         .expect("failed to create shm slot pool");
 
     // Text-injection setup (ARCHITECTURE.md §3.3). Both managers are seat-global
@@ -261,6 +263,7 @@ fn main() {
         font: FontRef::try_from_slice(FONT_BYTES).expect("bundled font failed to parse"),
         width: 0,
         height: initial_h,
+        scale: 1,
         configured: false,
         auto_hide,
         expanded: !auto_hide,
@@ -328,6 +331,9 @@ struct App {
     font: FontRef<'static>,
     width: u32,
     height: u32,
+    /// Integer HiDPI scale of the output the surface is on (1 = standard DPI).
+    /// Buffers are rendered at `logical × scale` physical pixels for crisp text.
+    scale: i32,
     configured: bool,
     /// When true, the keyboard collapses to a slim tap handle whenever no text
     /// field is focused, and pops back to full height on the next typing context.
@@ -658,13 +664,15 @@ impl App {
             return;
         }
         let (w, h) = (self.width, self.height);
-        let stride = w as i32 * 4;
+        let scale = self.scale;
+        let (pw, ph) = (w as i32 * scale, h as i32 * scale);
+        let stride = pw * 4;
         let (buffer, canvas) = self
             .pool
-            .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+            .create_buffer(pw, ph, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
         {
-            let mut cv = Canvas::new(canvas, w as usize, h as usize);
+            let mut cv = Canvas::new(canvas, w as usize, h as usize, scale);
             cv.clear(COL_SUGGEST_BG);
             let gw = (w as i32 / 5).clamp(96, 240);
             let gx = (w as i32 - gw) / 2;
@@ -672,7 +680,8 @@ impl App {
             let gy = (h as i32 - gh) / 2;
             cv.fill_round_rect(gx, gy, gw, gh, 2.5, COL_LABEL_DIM);
         }
-        self.layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
+        self.layer.wl_surface().set_buffer_scale(scale);
+        self.layer.wl_surface().damage_buffer(0, 0, pw, ph);
         buffer
             .attach_to(self.layer.wl_surface())
             .expect("failed to attach buffer");
@@ -702,13 +711,18 @@ impl App {
         let kind = self.current_kind();
         let shift_on = self.shift != Shift::Off;
         let sw = self.sugg_width();
-        let stride = w as i32 * 4;
+        // Render into a physical-resolution buffer (logical size × scale) and tell
+        // the compositor the buffer scale, so HiDPI output is pixel-crisp. All the
+        // drawing below stays in logical coordinates; Canvas scales internally.
+        let scale = self.scale;
+        let (pw, ph) = (w as i32 * scale, h as i32 * scale);
+        let stride = pw * 4;
         let (buffer, canvas) = self
             .pool
-            .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+            .create_buffer(pw, ph, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
         {
-            let mut cv = Canvas::new(canvas, w as usize, h as usize);
+            let mut cv = Canvas::new(canvas, w as usize, h as usize, scale);
             cv.clear(COL_BG);
 
             // Suggestion bar (top strip): the selected word sits in a rounded
@@ -854,8 +868,12 @@ impl App {
             }
         };
         self.prev_dyn = dyn_box;
+        self.layer.wl_surface().set_buffer_scale(scale);
         if dw > 0 && dh > 0 {
-            self.layer.wl_surface().damage_buffer(dx, dy, dw, dh);
+            // damage_buffer is in physical buffer pixels.
+            self.layer
+                .wl_surface()
+                .damage_buffer(dx * scale, dy * scale, dw * scale, dh * scale);
         }
         buffer
             .attach_to(self.layer.wl_surface())
@@ -1620,10 +1638,19 @@ impl CompositorHandler for App {
     fn scale_factor_changed(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: i32,
+        new_factor: i32,
     ) {
+        let new_scale = new_factor.max(1);
+        if new_scale != self.scale {
+            self.scale = new_scale;
+            eprintln!("swype-kbd: output scale is now {new_scale}x; re-rendering at device resolution");
+            // Repaint at the new physical resolution if we're already configured.
+            if self.configured {
+                self.draw(qh);
+            }
+        }
     }
 
     fn transform_changed(

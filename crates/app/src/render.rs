@@ -31,15 +31,35 @@ impl Color {
 /// A. We write that order explicitly so the code is endianness-correct.
 pub struct Canvas<'a> {
     buf: &'a mut [u8],
+    /// Physical (device-pixel) buffer dimensions: logical size × `scale`.
     width: usize,
     height: usize,
+    /// Integer HiDPI scale. All public drawing methods take *logical* coordinates
+    /// and multiply by this to address the physical buffer, so callers stay
+    /// resolution-independent and text/edges render at full device resolution.
+    scale: i32,
 }
 
 impl<'a> Canvas<'a> {
-    /// `buf` must be at least `width * height * 4` bytes.
-    pub fn new(buf: &'a mut [u8], width: usize, height: usize) -> Self {
-        debug_assert!(buf.len() >= width * height * 4);
-        Canvas { buf, width, height }
+    /// `width`/`height` are the *logical* canvas size; the backing `buf` must hold
+    /// the physical buffer, i.e. at least `(width*scale) * (height*scale) * 4`
+    /// bytes. `scale` is clamped to at least 1.
+    pub fn new(buf: &'a mut [u8], width: usize, height: usize, scale: i32) -> Self {
+        let scale = scale.max(1);
+        let (pw, ph) = (width * scale as usize, height * scale as usize);
+        debug_assert!(buf.len() >= pw * ph * 4);
+        Canvas { buf, width: pw, height: ph, scale }
+    }
+
+    /// Scale a logical integer coordinate to physical pixels.
+    #[inline]
+    fn s(&self, v: i32) -> i32 {
+        v * self.scale
+    }
+    /// Scale a logical float coordinate/size to physical pixels.
+    #[inline]
+    fn sf(&self, v: f32) -> f32 {
+        v * self.scale as f32
     }
 
     #[allow(dead_code)]
@@ -62,8 +82,13 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Fill an axis-aligned rectangle with an opaque color, clipped to the canvas.
+    /// Fill an axis-aligned rectangle (logical coords) with an opaque color.
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, c: Color) {
+        self.fill_rect_px(self.s(x), self.s(y), self.s(w), self.s(h), c);
+    }
+
+    /// Physical-pixel rectangle fill, clipped to the canvas.
+    fn fill_rect_px(&mut self, x: i32, y: i32, w: i32, h: i32, c: Color) {
         let x0 = x.max(0) as usize;
         let y0 = y.max(0) as usize;
         let x1 = ((x + w).max(0) as usize).min(self.width);
@@ -101,6 +126,8 @@ impl<'a> Canvas<'a> {
     /// Fill a rounded rectangle with anti-aliased corners. Straight spans use the
     /// fast opaque path; only the four corner squares are blended per-pixel.
     pub fn fill_round_rect(&mut self, x: i32, y: i32, w: i32, h: i32, radius: f32, c: Color) {
+        let (x, y, w, h) = (self.s(x), self.s(y), self.s(w), self.s(h));
+        let radius = self.sf(radius);
         if w <= 0 || h <= 0 {
             return;
         }
@@ -108,9 +135,9 @@ impl<'a> Canvas<'a> {
         let ri = r.ceil() as i32;
         // Opaque interior: a tall middle band plus the two side bands, leaving the
         // four ri×ri corner squares for the anti-aliased arcs.
-        self.fill_rect(x + ri, y, w - 2 * ri, h, c);
-        self.fill_rect(x, y + ri, ri, h - 2 * ri, c);
-        self.fill_rect(x + w - ri, y + ri, ri, h - 2 * ri, c);
+        self.fill_rect_px(x + ri, y, w - 2 * ri, h, c);
+        self.fill_rect_px(x, y + ri, ri, h - 2 * ri, c);
+        self.fill_rect_px(x + w - ri, y + ri, ri, h - 2 * ri, c);
         self.round_corners(x, y, w, h, ri, r, c, 1.0);
     }
 
@@ -126,6 +153,8 @@ impl<'a> Canvas<'a> {
         c: Color,
         alpha: f32,
     ) {
+        let (x, y, w, h) = (self.s(x), self.s(y), self.s(w), self.s(h));
+        let radius = self.sf(radius);
         if w <= 0 || h <= 0 || alpha <= 0.0 {
             return;
         }
@@ -137,7 +166,7 @@ impl<'a> Canvas<'a> {
         self.round_corners(x, y, w, h, ri, r, c, alpha);
     }
 
-    /// Blend a constant-`alpha` rectangle, clipped to the canvas.
+    /// Blend a constant-`alpha` rectangle (physical coords), clipped to the canvas.
     fn fill_rect_alpha(&mut self, x: i32, y: i32, w: i32, h: i32, c: Color, alpha: f32) {
         let x0 = x.max(0);
         let y0 = y.max(0);
@@ -180,10 +209,14 @@ impl<'a> Canvas<'a> {
         if pts.len() < 2 || width <= 0.0 {
             return;
         }
+        // Scale the polyline and stroke width to physical pixels.
+        let sc = self.scale as f32;
+        let pts: Vec<(f32, f32)> = pts.iter().map(|&(x, y)| (x * sc, y * sc)).collect();
+        let width = width * sc;
         let r = width / 2.0;
         let pad = r + 1.0;
         let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for &(px, py) in pts {
+        for &(px, py) in &pts {
             minx = minx.min(px);
             miny = miny.min(py);
             maxx = maxx.max(px);
@@ -241,6 +274,8 @@ impl<'a> Canvas<'a> {
         size: f32,
         c: Color,
     ) {
+        let (x, y, w, h) = (self.s(x), self.s(y), self.s(w), self.s(h));
+        let size = self.sf(size);
         let px = PxScale::from(size);
         let scaled = font.as_scaled(px);
         let mut width = 0.0f32;
@@ -299,11 +334,11 @@ mod tests {
     fn fill_rect_clips_and_writes_bgra() {
         let mut buf = vec![0u8; 4 * 4 * 4]; // 4x4 px
         {
-            let mut cv = Canvas::new(&mut buf, 4, 4);
+            let mut cv = Canvas::new(&mut buf, 4, 4, 1);
             cv.fill_rect(-1, -1, 3, 3, Color::rgb(0x12, 0x34, 0x56));
         }
         assert_eq!(&buf[0..4], &[0x56, 0x34, 0x12, 0xFF]);
-        let i = (1 * 4 + 1) * 4;
+        let i = (4 + 1) * 4;
         assert_eq!(&buf[i..i + 4], &[0x56, 0x34, 0x12, 0xFF]);
         let i = (2 * 4 + 2) * 4;
         assert_eq!(&buf[i..i + 4], &[0, 0, 0, 0]);
@@ -313,7 +348,7 @@ mod tests {
     fn blend_half_coverage_is_midpoint() {
         let mut buf = vec![0u8; 4]; // 1x1
         {
-            let mut cv = Canvas::new(&mut buf, 1, 1);
+            let mut cv = Canvas::new(&mut buf, 1, 1, 1);
             cv.blend(0, 0, Color::rgb(0xFF, 0xFF, 0xFF), 0.5);
         }
         // black background blended halfway to white ~= 0x7F, opaque alpha.
@@ -325,11 +360,11 @@ mod tests {
     fn round_rect_corner_is_softer_than_center() {
         let mut buf = vec![0u8; 20 * 20 * 4];
         {
-            let mut cv = Canvas::new(&mut buf, 20, 20);
+            let mut cv = Canvas::new(&mut buf, 20, 20, 1);
             cv.fill_round_rect(0, 0, 20, 20, 6.0, Color::rgb(0xFF, 0xFF, 0xFF));
         }
         // The extreme corner pixel is only partly covered; the center is solid.
-        let corner = buf[(0 * 20 + 0) * 4];
+        let corner = buf[0];
         let center = buf[(10 * 20 + 10) * 4];
         assert!(corner < center, "corner {corner} should be softer than center {center}");
         assert_eq!(center, 0xFF);
