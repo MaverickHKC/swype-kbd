@@ -4,13 +4,17 @@
 //! to the bottom of the screen and prints the key hit by each pointer press to
 //! stdout. No text injection or gesture decoding yet (see ARCHITECTURE.md §5).
 
-mod font;
 mod input;
 mod keyboard;
 mod render;
 
+use ab_glyph::FontRef;
 use keyboard::{KeyAction, LayerKind, VisualKeyboard};
 use render::{Canvas, Color};
+
+/// Bundled UI font (DejaVu Sans; license in assets/). Embedded so the binary is
+/// self-contained and does not depend on system fontconfig.
+const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 
 /// Which base layer the keyboard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,15 +97,25 @@ const TAP_FRACTION: f32 = 0.45;
 /// decoder smooths separately via `DecoderParams::smooth_passes`).
 const TRAIL_SMOOTH_PASSES: usize = 2;
 
-// --- palette ---------------------------------------------------------------
-const COL_BG: Color = Color::rgb(0x1a, 0x1c, 0x22);
-const COL_KEY: Color = Color::rgb(0x33, 0x37, 0x42);
-const COL_KEY_FN: Color = Color::rgb(0x26, 0x2a, 0x33);
-const COL_KEY_PRESSED: Color = Color::rgb(0x4c, 0x8b, 0xf5);
-const COL_LABEL: Color = Color::rgb(0xe6, 0xe8, 0xee);
-const COL_TRAIL: Color = Color::rgb(0x6f, 0xa8, 0xff);
-const COL_SUGGEST_BG: Color = Color::rgb(0x12, 0x14, 0x18);
-const COL_SUGGEST_SEL: Color = Color::rgb(0x2a, 0x3a, 0x5a);
+// --- palette (cohesive dark slate theme) -----------------------------------
+const COL_BG: Color = Color::rgb(0x12, 0x14, 0x19); // gaps behind the keys
+const COL_KEY: Color = Color::rgb(0x2c, 0x31, 0x3d); // character keys
+const COL_KEY_FN: Color = Color::rgb(0x21, 0x25, 0x2f); // function keys (dimmer)
+const COL_KEY_PRESSED: Color = Color::rgb(0x3b, 0x82, 0xf6); // accent (held / shift)
+const COL_KEY_SHADOW: Color = Color::rgb(0x00, 0x00, 0x00); // soft drop shadow
+const COL_LABEL: Color = Color::rgb(0xf2, 0xf4, 0xf8); // character labels
+const COL_LABEL_DIM: Color = Color::rgb(0x9a, 0xa3, 0xb2); // function-key labels
+const COL_LABEL_ON_ACCENT: Color = Color::rgb(0xff, 0xff, 0xff);
+const COL_TRAIL: Color = Color::rgb(0x6f, 0xb0, 0xff); // gesture trail / glow
+const COL_SUGGEST_BG: Color = Color::rgb(0x17, 0x1a, 0x21); // suggestion strip
+const COL_SUGGEST_SEL: Color = Color::rgb(0x30, 0x41, 0x63); // selected-word pill
+const COL_SUGGEST_SEP: Color = Color::rgb(0x24, 0x28, 0x31); // cell separators
+
+// --- geometry --------------------------------------------------------------
+/// Corner radius for key caps, in pixels.
+const KEY_RADIUS: f32 = 9.0;
+/// Corner radius for the selected-suggestion pill.
+const PILL_RADIUS: f32 = 12.0;
 
 fn main() {
     let conn = Connection::connect_to_env()
@@ -192,6 +206,7 @@ fn main() {
         pool,
         layer,
         keyboard: VisualKeyboard::new(),
+        font: FontRef::try_from_slice(FONT_BYTES).expect("bundled font failed to parse"),
         width: 0,
         height: KBD_HEIGHT,
         configured: false,
@@ -244,6 +259,8 @@ struct App {
     pool: SlotPool,
     layer: LayerSurface,
     keyboard: VisualKeyboard,
+    /// The bundled anti-aliased UI font, parsed once.
+    font: FontRef<'static>,
     width: u32,
     height: u32,
     configured: bool,
@@ -448,43 +465,68 @@ impl App {
             let mut cv = Canvas::new(canvas, w as usize, h as usize);
             cv.clear(COL_BG);
 
-            // Suggestion bar (top strip).
+            // Suggestion bar (top strip): the selected word sits in a rounded
+            // pill, thin separators divide the rest.
             cv.fill_rect(0, 0, w as i32, SUGGEST_H as i32, COL_SUGGEST_BG);
             let n = self.suggestions.len().min(4);
             if n > 0 {
                 let cellw = w as i32 / n as i32;
-                let sscale = (SUGGEST_H / (font::GLYPH_H as u32 * 2)).clamp(2, 5) as usize;
+                let ssize = (SUGGEST_H as f32 * 0.42).round();
                 for (i, word) in self.suggestions.iter().take(4).enumerate() {
                     let cx = i as i32 * cellw;
                     if i == 0 {
-                        cv.fill_rect(cx + 2, 2, cellw - 4, SUGGEST_H as i32 - 4, COL_SUGGEST_SEL);
+                        let m = 6;
+                        cv.fill_round_rect(
+                            cx + m,
+                            m,
+                            cellw - 2 * m,
+                            SUGGEST_H as i32 - 2 * m,
+                            PILL_RADIUS,
+                            COL_SUGGEST_SEL,
+                        );
+                    } else {
+                        cv.fill_rect(cx, 10, 1, SUGGEST_H as i32 - 20, COL_SUGGEST_SEP);
                     }
-                    cv.draw_text_centered(word, cx, 0, cellw, SUGGEST_H as i32, sscale, COL_LABEL);
+                    cv.text_centered(&self.font, word, cx, 0, cellw, SUGGEST_H as i32, ssize, COL_LABEL);
                 }
             }
+            // Hairline under the suggestion bar to separate it from the keys.
+            cv.fill_rect(0, off - 1, w as i32, 1, COL_BG);
 
-            // Keys, drawn in the area below the suggestion bar.
-            let scale = key_label_scale(key_h);
+            // Keys, drawn in the area below the suggestion bar: a soft drop shadow,
+            // a rounded cap, then the anti-aliased label.
+            let ksize = key_label_size(key_h);
             for (i, cap) in self.keyboard.caps(kind).iter().enumerate() {
                 let r = self.keyboard.rect_of(cap, w, key_h);
-                // 2px gap between keys; offset by the suggestion bar height.
-                let (kx, ky, kw, kh) = (r.x + 2, r.y + off + 2, r.w - 4, r.h - 4);
+                // 3px gap between keys; offset by the suggestion bar height.
+                let (kx, ky, kw, kh) = (r.x + 3, r.y + off + 3, r.w - 6, r.h - 6);
                 let active_shift = cap.action == KeyAction::Shift && shift_on;
-                let fill = if self.pressed == Some(i) || active_shift {
+                let accent = self.pressed == Some(i) || active_shift;
+                let is_char = matches!(cap.action, KeyAction::Char(_));
+                let fill = if accent {
                     COL_KEY_PRESSED
-                } else if matches!(cap.action, KeyAction::Char(_)) {
+                } else if is_char {
                     COL_KEY
                 } else {
                     COL_KEY_FN
                 };
-                cv.fill_rect(kx, ky, kw, kh, fill);
+                // Drop shadow: same rounded shape, nudged down, faint.
+                cv.fill_round_rect_alpha(kx, ky + 2, kw, kh, KEY_RADIUS, COL_KEY_SHADOW, 0.28);
+                cv.fill_round_rect(kx, ky, kw, kh, KEY_RADIUS, fill);
                 if !cap.label.is_empty() {
-                    cv.draw_text_centered(&cap.label, kx, ky, kw, kh, scale, COL_LABEL);
+                    let label_col = if accent {
+                        COL_LABEL_ON_ACCENT
+                    } else if is_char {
+                        COL_LABEL
+                    } else {
+                        COL_LABEL_DIM
+                    };
+                    cv.text_centered(&self.font, &cap.label, kx, ky, kw, kh, ksize, label_col);
                 }
                 // The pressed-key highlight is dynamic: it must repaint when the
                 // press moves or lifts. (active_shift flips only on a full redraw.)
                 if self.pressed == Some(i) {
-                    union_box(&mut dyn_box, r.x, r.y + off, r.w, r.h);
+                    union_box(&mut dyn_box, r.x, r.y + off, r.w, r.h + 3);
                 }
             }
 
@@ -501,37 +543,31 @@ impl App {
                             let ph = (r.h as f32 * 1.3) as i32;
                             let px = (r.x + (r.w - pw) / 2).clamp(0, w as i32 - pw);
                             let py = (r.y + off - ph - 6).max(0);
-                            cv.fill_rect(px, py, pw, ph, COL_KEY_PRESSED);
-                            let pscale = (scale + 2).min(8);
-                            cv.draw_text_centered(&cap.label, px, py, pw, ph, pscale, COL_LABEL);
-                            union_box(&mut dyn_box, px, py, pw, ph);
+                            cv.fill_round_rect_alpha(px, py + 3, pw, ph, KEY_RADIUS, COL_KEY_SHADOW, 0.32);
+                            cv.fill_round_rect(px, py, pw, ph, KEY_RADIUS, COL_KEY_PRESSED);
+                            let psize = (ksize * 1.4).min((ph as f32) * 0.7);
+                            cv.text_centered(&self.font, &cap.label, px, py, pw, ph, psize, COL_LABEL_ON_ACCENT);
+                            union_box(&mut dyn_box, px, py + 3, pw, ph);
                         }
                     }
                 }
             }
 
             // Live gesture trail, smoothed so finger jitter doesn't render as a
-            // ragged line. Endpoints are held fixed, so the trail still tracks
-            // the fingertip exactly. Cheap: gestures are at most a few hundred
-            // points and this runs only while pressing.
+            // ragged line. A wide faint pass gives a soft glow, a brighter core
+            // pass the line itself; both are translucent so the keys show through.
+            // Cheap: gestures are a few hundred points, only while pressing.
             if self.pressing && self.gesture.len() >= 2 {
                 let raw = Trace::from_points(
                     self.gesture.iter().map(|&(x, y, t)| Point::new(x, y, t)).collect(),
                 );
                 let trail = raw.smoothed(TRAIL_SMOOTH_PASSES);
-                for win in trail.points.windows(2) {
-                    cv.draw_line(
-                        win[0].x as i32,
-                        win[0].y as i32,
-                        win[1].x as i32,
-                        win[1].y as i32,
-                        4,
-                        COL_TRAIL,
-                    );
-                }
-                // Trail bbox, inflated past the 4px line width + smoothing slack.
-                for p in &trail.points {
-                    union_box(&mut dyn_box, p.x as i32 - 4, p.y as i32 - 4, 8, 8);
+                let pts: Vec<(f32, f32)> = trail.points.iter().map(|p| (p.x, p.y)).collect();
+                cv.stroke_trail(&pts, 16.0, COL_TRAIL, 0.16);
+                cv.stroke_trail(&pts, 6.0, COL_TRAIL, 0.92);
+                // Trail bbox, inflated past the glow width + smoothing slack.
+                for &(x, y) in &pts {
+                    union_box(&mut dyn_box, x as i32 - 9, y as i32 - 9, 18, 18);
                 }
             }
         }
@@ -1094,11 +1130,11 @@ fn union_box(acc: &mut Option<(i32, i32, i32, i32)>, x: i32, y: i32, w: i32, h: 
     });
 }
 
-/// Scale factor for key labels, derived from row height so labels stay legible.
-fn key_label_scale(height: u32) -> usize {
-    // 4 rows; aim for a glyph ~1/3 of the row height.
-    let row_h = height / 4;
-    ((row_h / (font::GLYPH_H as u32 * 2)).max(1)).min(6) as usize
+/// Pixel font size for key labels, derived from row height so labels stay
+/// legible and proportionate (~40% of a row).
+fn key_label_size(height: u32) -> f32 {
+    let row_h = height as f32 / 4.0;
+    (row_h * 0.4).clamp(14.0, 34.0)
 }
 
 /// Punctuation that should sit tight against the preceding word (no space

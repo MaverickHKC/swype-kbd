@@ -272,6 +272,8 @@ mod tests {
 
     #[test]
     fn every_cap_has_a_renderable_label_or_is_space() {
+        use ab_glyph::Font;
+        let font = ab_glyph::FontRef::try_from_slice(crate::FONT_BYTES).unwrap();
         let kb = VisualKeyboard::new();
         for kind in [
             LayerKind::LettersLower,
@@ -284,7 +286,8 @@ mod tests {
                     continue;
                 }
                 for ch in cap.label.chars() {
-                    assert!(crate::font::glyph(ch).is_some(), "no glyph for {ch:?} in {kind:?}");
+                    // Glyph id 0 is .notdef — the font cannot render the char.
+                    assert!(font.glyph_id(ch).0 != 0, "no glyph for {ch:?} in {kind:?}");
                 }
             }
         }
