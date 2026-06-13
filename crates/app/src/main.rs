@@ -300,6 +300,8 @@ fn main() {
         input_method,
         im_active: false,
         im_pending_active: false,
+        sensitive_field: false,
+        pending_sensitive: false,
         im_serial: 0,
         _vk_mgr: vk_mgr,
         virtual_keyboard,
@@ -415,6 +417,11 @@ struct App {
     im_active: bool,
     /// Pending activation state, applied on the next `done`.
     im_pending_active: bool,
+    /// Whether the focused field is a password/PIN/sensitive field. While set, no
+    /// typed text is learned or persisted, so secrets never reach disk.
+    sensitive_field: bool,
+    /// Pending sensitivity from `content_type`, applied on the next `done`.
+    pending_sensitive: bool,
     /// Count of `done` events received — the serial for `commit`.
     im_serial: u32,
     _vk_mgr: Option<ZwpVirtualKeyboardManagerV1>,
@@ -465,6 +472,27 @@ fn personal_path() -> PathBuf {
     state_path("personal.txt")
 }
 
+/// Write `contents` to `path` with owner-only permissions (file 0600, parent dir
+/// 0700), creating the directory if needed. The state files hold personal
+/// vocabulary, so they must not be readable by other local users.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // Enforce 0600 even if the file pre-existed with looser permissions.
+    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    f.write_all(contents.as_bytes())
+}
+
 /// Load `word count` lines into a map (lowercase keys). Missing file -> empty.
 fn load_personal(path: &Path) -> HashMap<String, u32> {
     let mut map = HashMap::new();
@@ -483,14 +511,11 @@ fn load_personal(path: &Path) -> HashMap<String, u32> {
 
 /// Persist the personal-dictionary counts. Best-effort; errors are logged.
 fn save_personal(path: &Path, map: &HashMap<String, u32>) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let mut s = String::new();
     for (w, c) in map {
         s.push_str(&format!("{w} {c}\n"));
     }
-    if let Err(e) = std::fs::write(path, s) {
+    if let Err(e) = write_private(path, &s) {
         eprintln!("swype-kbd: could not save personal dictionary to {}: {e}", path.display());
     }
 }
@@ -521,16 +546,13 @@ fn load_bigrams(path: &Path) -> HashMap<String, HashMap<String, u32>> {
 
 /// Persist the bigram counts. Best-effort; errors are logged.
 fn save_bigrams(path: &Path, map: &HashMap<String, HashMap<String, u32>>) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let mut s = String::new();
     for (prev, succ) in map {
         for (next, c) in succ {
             s.push_str(&format!("{prev} {next} {c}\n"));
         }
     }
-    if let Err(e) = std::fs::write(path, s) {
+    if let Err(e) = write_private(path, &s) {
         eprintln!("swype-kbd: could not save next-word data to {}: {e}", path.display());
     }
 }
@@ -553,14 +575,11 @@ fn load_learned(path: &Path) -> HashMap<String, f32> {
 
 /// Persist the learned-words map. Best-effort; errors are logged, not fatal.
 fn save_learned(path: &Path, map: &HashMap<String, f32>) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let mut s = String::new();
     for (w, b) in map {
         s.push_str(&format!("{w} {b}\n"));
     }
-    if let Err(e) = std::fs::write(path, s) {
+    if let Err(e) = write_private(path, &s) {
         eprintln!("swype-kbd: could not save learned words to {}: {e}", path.display());
     }
 }
@@ -1119,6 +1138,9 @@ impl App {
     /// completed), so genuinely-used vocabulary rises over time. Passive
     /// learning: shares the correction clamp and persistence, smaller delta.
     fn reward_use(&mut self, word: &str) {
+        if self.sensitive_field {
+            return;
+        }
         self.adjust_learning(word, PASSIVE_DELTA);
         save_learned(&self.learned_path, &self.learned);
     }
@@ -1143,6 +1165,9 @@ impl App {
     /// it once it crosses the threshold — after which it decodes and completes
     /// like any other word.
     fn count_new_word(&mut self, key: &str) {
+        if self.sensitive_field {
+            return;
+        }
         let count = self.personal.entry(key.to_string()).or_insert(0);
         *count += 1;
         let count = *count;
@@ -1159,6 +1184,13 @@ impl App {
     /// the (previous word -> word) bigram for next-word prediction and make
     /// `word` the new context. Lowercased; non-word input clears the context.
     fn finished_word(&mut self, word: &str) {
+        // Never learn next-word context from a sensitive field, and don't carry
+        // context across it.
+        if self.sensitive_field {
+            self.prev_word = None;
+            self.last_bigram = None;
+            return;
+        }
         let w = word.to_ascii_lowercase();
         if w.is_empty() || !w.chars().all(|c| c.is_ascii_alphabetic()) {
             self.prev_word = None;
@@ -1930,13 +1962,40 @@ impl Dispatch<ZwpInputMethodV2, ()> for App {
     ) {
         use zwp_input_method_v2::Event;
         match event {
-            // activate/deactivate are pending until the batch's `done`.
-            Event::Activate => state.im_pending_active = true,
+            // activate/deactivate are pending until the batch's `done`. A fresh
+            // activation defaults to non-sensitive; a content_type event (which
+            // the compositor sends before `done`) may flag it sensitive.
+            Event::Activate => {
+                state.im_pending_active = true;
+                state.pending_sensitive = false;
+            }
             Event::Deactivate => state.im_pending_active = false,
+            // The focused field's purpose. We never learn from or persist text
+            // typed into a password/PIN field, or one hinting sensitive data, so
+            // secrets never reach disk. (purpose/hint are text-input-v3 values:
+            // password=8, pin=9; hint bit sensitive_data=0x80.)
+            Event::ContentType { hint, purpose } => {
+                let purpose = u32::from(purpose);
+                let hint = u32::from(hint);
+                state.pending_sensitive = matches!(purpose, 8 | 9) || (hint & 0x80) != 0;
+            }
             Event::Done => {
                 let was_active = state.im_active;
+                let was_sensitive = state.sensitive_field;
                 state.im_active = state.im_pending_active;
+                state.sensitive_field = state.im_active && state.pending_sensitive;
                 state.im_serial = state.im_serial.wrapping_add(1);
+                // Entering a sensitive field: drop any carried prediction context
+                // so no bigram bridges into or out of the secret.
+                if state.sensitive_field {
+                    state.reset_context();
+                }
+                if state.sensitive_field != was_sensitive {
+                    eprintln!(
+                        "swype-kbd: {} (password/sensitive field)",
+                        if state.sensitive_field { "learning SUSPENDED" } else { "learning resumed" }
+                    );
+                }
                 // Follow text-field focus: a field gaining focus pops the keyboard
                 // up, losing focus collapses it to the handle. No-op when auto-hide
                 // is off, or when the user has manually toggled to the same state.
@@ -1952,7 +2011,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for App {
                 // collapsed — dock it (the virtual-keyboard path still types).
                 state.set_expanded(true);
             }
-            // surrounding_text / text_change_cause / content_type: unused in M2.
+            // surrounding_text / text_change_cause: unused.
             _ => {}
         }
     }
