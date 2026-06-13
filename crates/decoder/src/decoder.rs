@@ -89,6 +89,45 @@ impl Decoder {
         }
     }
 
+    /// Top `max` dictionary words beginning with `prefix`, ranked by (learned)
+    /// frequency — the predictive completions for tap typing. The prefix itself,
+    /// if it is a word, is included so it can be committed with a space. Case-
+    /// insensitive; returns lowercase dictionary words.
+    pub fn complete(&self, prefix: &str, max: usize) -> Vec<String> {
+        if prefix.is_empty() || max == 0 {
+            return Vec::new();
+        }
+        let p = prefix.to_ascii_lowercase();
+        let mut hits: Vec<(&str, f32)> = self
+            .templates
+            .iter()
+            .filter_map(|t| {
+                let w = self.dict.word(t.word_index);
+                if w.starts_with(&p) {
+                    Some((w, t.ln_freq))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+        hits.truncate(max);
+        hits.into_iter().map(|(w, _)| w.to_string()).collect()
+    }
+
+    /// Whether `word` is a known (gestureable) dictionary word.
+    pub fn contains(&self, word: &str) -> bool {
+        self.index.contains_key(&word.to_ascii_lowercase())
+    }
+
+    /// The (learned) log-frequency of a word, or `None` if it has no template.
+    /// Comparable across words: higher means more frequent.
+    pub fn ln_freq_of(&self, word: &str) -> Option<f32> {
+        self.index
+            .get(&word.to_ascii_lowercase())
+            .map(|&i| self.templates[i].ln_freq)
+    }
+
     /// Adjust a word's log-frequency prior by `delta` (per-user learning).
     /// Returns true if the word has a template. The change affects all future
     /// `decode` calls; persistence is the caller's responsibility.
@@ -227,6 +266,23 @@ mod tests {
         assert_eq!(after[0].word, alt, "boosted word should now rank first");
         // Unknown words are a no-op.
         assert!(!dec.learn("zzzzqx", 1.0));
+    }
+
+    #[test]
+    fn completion_ranks_by_frequency_and_respects_prefix() {
+        let mut dec = decoder();
+        let comps = dec.complete("th", 5);
+        assert!(!comps.is_empty());
+        assert!(comps.iter().all(|w| w.starts_with("th")));
+        // "the" is the most frequent th- word in the embedded list.
+        assert_eq!(comps[0], "the");
+        // Learning lifts a completion.
+        let target = "this".to_string();
+        assert!(dec.learn(&target, 50.0));
+        let comps2 = dec.complete("th", 5);
+        assert_eq!(comps2[0], "this");
+        // Empty prefix -> nothing.
+        assert!(dec.complete("", 5).is_empty());
     }
 
     #[test]

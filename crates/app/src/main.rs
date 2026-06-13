@@ -30,6 +30,17 @@ enum Shift {
     Lock,
 }
 
+/// What the current suggestion-bar entries mean — so tapping one does the right
+/// thing (complete the tapped word vs. replace the committed gesture word).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuggestKind {
+    None,
+    /// Predictions for the word currently being tap-typed.
+    Completions,
+    /// Alternates for a word just committed by a gesture.
+    GestureAlternates,
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -199,6 +210,8 @@ fn main() {
         pressing: false,
         suggestions: Vec::new(),
         last_committed: None,
+        left: String::new(),
+        suggest_kind: SuggestKind::None,
         _im_mgr: im_mgr,
         input_method,
         im_active: false,
@@ -263,6 +276,12 @@ struct App {
     suggestions: Vec<String>,
     /// The word last committed by a gesture, for tap-to-replace.
     last_committed: Option<String>,
+    /// A local mirror of the text just left of the cursor (our own edits),
+    /// bounded in length. The current word for prediction is derived as its
+    /// trailing run of letters, so prediction survives backspacing over a space.
+    left: String,
+    /// Meaning of the current suggestion-bar entries.
+    suggest_kind: SuggestKind,
 
     // --- text injection (ARCHITECTURE.md §3.3) ---
     _im_mgr: Option<ZwpInputMethodManagerV2>,
@@ -507,20 +526,22 @@ impl App {
     fn on_press(&mut self, x: f64, y: f64, qh: &QueueHandle<Self>) {
         let (px, py) = (x as f32, y as f32);
 
-        // A press in the suggestion bar replaces the committed word.
+        // A press in the suggestion bar acts on the tapped word: complete the
+        // word being typed, or replace the word a gesture just committed.
         if (py as u32) < SUGGEST_H {
             if let Some(word) = self.suggestion_at(px) {
-                self.replace_with(&word);
+                match self.suggest_kind {
+                    SuggestKind::Completions => self.complete_with(&word),
+                    SuggestKind::GestureAlternates => self.replace_with(&word),
+                    SuggestKind::None => {}
+                }
                 self.draw(qh);
             }
             return;
         }
 
         // Otherwise begin capturing a press in the key area. Whether it is a tap
-        // or a gesture is decided on release. Starting fresh clears any prior
-        // suggestions / committed-word state.
-        self.suggestions.clear();
-        self.last_committed = None;
+        // or a gesture is decided on release.
         self.gesture.clear();
         self.gesture_start = Some(Instant::now());
         self.gesture.push((px, py, 0));
@@ -622,6 +643,7 @@ impl App {
                         }
                     })
                     .collect();
+                self.suggest_kind = SuggestKind::GestureAlternates;
                 let alts: Vec<&String> = self.suggestions.iter().skip(1).collect();
                 println!("gesture -> '{word}'  alternates: {alts:?}  ({decode_us} us)");
             }
@@ -636,6 +658,9 @@ impl App {
             for ch in text.chars() {
                 self.vk_type_char(ch);
             }
+        }
+        for ch in text.chars() {
+            self.push_left(ch);
         }
         self.last_committed = Some(word.to_string());
         self.auto_space = true;
@@ -657,6 +682,9 @@ impl App {
                 for _ in 0..del {
                     self.vk_tap(input::KEY_BACKSPACE);
                 }
+            }
+            for _ in 0..del {
+                self.left.pop();
             }
         }
         self.commit_word(word);
@@ -722,15 +750,18 @@ impl App {
                 if !self.commit_text(" ") {
                     self.vk_type_char(' ');
                 }
+                self.push_left(' ');
                 self.auto_space = false;
             }
             KeyAction::Backspace => {
                 self.vk_tap(input::KEY_BACKSPACE);
+                self.left.pop();
                 self.auto_space = false;
                 self.pending_cap = false;
             }
             KeyAction::Enter => {
                 self.vk_tap(input::KEY_ENTER);
+                self.push_left('\n');
                 self.auto_space = false;
                 self.pending_cap = true; // new line starts a sentence
             }
@@ -761,6 +792,7 @@ impl App {
             KeyAction::ToSymbols2 => self.base = Base::Symbols2,
         }
         self.apply_autocap();
+        self.refresh_completions();
         print_action(action); // keep the stdout trace for debugging
     }
 
@@ -784,6 +816,63 @@ impl App {
         self.pending_cap = is_sentence_end(c);
     }
 
+    /// The word for prediction: the trailing run of letters left of the cursor.
+    fn current_word(&self) -> String {
+        let rev: String = self
+            .left
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        rev.chars().rev().collect()
+    }
+
+    /// Recompute predictive completions from the word left of the cursor.
+    fn refresh_completions(&mut self) {
+        let word = if self.base == Base::Letters {
+            self.current_word()
+        } else {
+            String::new()
+        };
+        if word.is_empty() {
+            // Don't disturb gesture alternates; just drop stale completions.
+            if self.suggest_kind == SuggestKind::Completions {
+                self.suggestions.clear();
+                self.suggest_kind = SuggestKind::None;
+            }
+            return;
+        }
+        let comps = self.decoder.complete(&word, 4);
+        if comps.is_empty() {
+            if self.suggest_kind == SuggestKind::Completions {
+                self.suggestions.clear();
+                self.suggest_kind = SuggestKind::None;
+            }
+            return;
+        }
+        let cap = word.chars().next().is_some_and(|c| c.is_uppercase());
+        self.suggestions = comps
+            .iter()
+            .map(|w| if cap { capitalize(w) } else { w.clone() })
+            .collect();
+        self.suggest_kind = SuggestKind::Completions;
+    }
+
+    /// Finish the current word from a tapped prediction: type the part after the
+    /// already-typed prefix plus a space.
+    fn complete_with(&mut self, word: &str) {
+        let pre = self.current_word().chars().count();
+        let suffix: String = word.chars().skip(pre).collect();
+        for ch in suffix.chars() {
+            self.type_char(ch);
+        }
+        self.type_char(' ');
+        self.auto_space = true;
+        self.last_committed = Some(word.to_ascii_lowercase());
+        self.refresh_completions();
+        println!("complete -> '{word}'");
+    }
+
     /// If a sentence just ended, latch a one-shot shift so the next letter
     /// capitalizes (only when the user hasn't set shift themselves).
     fn apply_autocap(&mut self) {
@@ -793,24 +882,43 @@ impl App {
     }
 
     /// Type one character: input-method commit when a field is active, else a
-    /// synthesized keystroke.
+    /// synthesized keystroke. Mirrors the character into `left`.
     fn type_char(&mut self, c: char) {
         let mut buf = [0u8; 4];
         if !self.commit_text(c.encode_utf8(&mut buf)) {
             self.vk_type_char(c);
         }
+        self.push_left(c);
     }
 
-    /// Delete one character before the cursor via whichever channel is live.
+    /// Delete one character before the cursor via whichever channel is live, and
+    /// mirror the deletion into `left`.
     fn delete_one(&mut self) {
         if self.im_active {
             if let Some(im) = &self.input_method {
                 im.delete_surrounding_text(1, 0);
                 im.commit(self.im_serial);
+                self.left.pop();
                 return;
             }
         }
         self.vk_tap(input::KEY_BACKSPACE);
+        self.left.pop();
+    }
+
+    /// Append a character to the bounded left-of-cursor mirror.
+    fn push_left(&mut self, c: char) {
+        self.left.push(c);
+        // Bound the mirror; only the trailing word matters for prediction.
+        const MAX_LEFT: usize = 256;
+        if self.left.len() > MAX_LEFT {
+            let start = self.left.len() - MAX_LEFT;
+            // Snap to a char boundary.
+            let start = (start..self.left.len())
+                .find(|&i| self.left.is_char_boundary(i))
+                .unwrap_or(self.left.len());
+            self.left.drain(..start);
+        }
     }
 
     /// Commit text via the input-method channel. Returns false if no field is
