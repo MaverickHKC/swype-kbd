@@ -216,6 +216,7 @@ fn main() {
         left: String::new(),
         suggest_kind: SuggestKind::None,
         undo: None,
+        prev_dyn: None,
         _im_mgr: im_mgr,
         input_method,
         im_active: false,
@@ -290,6 +291,10 @@ struct App {
     /// space) that the very next Backspace removes as a unit — one-tap undo of a
     /// gesture/completion/replacement. Any other tapped key disarms it.
     undo: Option<u32>,
+    /// Bounding box (x0, y0, x1, y1 in buffer pixels) of the dynamic overlay —
+    /// trail, key pop-up, pressed-key highlight — drawn last frame. The partial
+    /// damage path unions it with this frame's box so vacated pixels repaint.
+    prev_dyn: Option<(i32, i32, i32, i32)>,
 
     // --- text injection (ARCHITECTURE.md §3.3) ---
     _im_mgr: Option<ZwpInputMethodManagerV2>,
@@ -407,11 +412,28 @@ fn upload_keymap(vk: &ZwpVirtualKeyboardV1) -> Result<std::fs::File, Box<dyn std
 }
 
 impl App {
-    /// Repaint the whole keyboard into a fresh buffer and present it.
+    /// Full repaint with whole-surface damage — for structural changes (layer or
+    /// shift switch, suggestion-bar updates, commits, resize).
     fn draw(&mut self, qh: &QueueHandle<Self>) {
+        self.render(qh, true);
+    }
+
+    /// Repaint reporting only the changed region — for the high-frequency motion
+    /// path, where just the trail / pop-up / pressed key move. The whole buffer
+    /// is still rendered (so it is always correct), but the compositor is told to
+    /// re-composite only the dynamic band.
+    fn draw_motion(&mut self, qh: &QueueHandle<Self>) {
+        self.render(qh, false);
+    }
+
+    /// Repaint the whole keyboard into a fresh buffer and present it, damaging
+    /// either the whole surface (`full`) or just the dynamic overlay region.
+    fn render(&mut self, qh: &QueueHandle<Self>, full: bool) {
         if self.width == 0 || self.height == 0 {
             return;
         }
+        // Bounding box of dynamic overlay drawn this frame (buffer-pixel corners).
+        let mut dyn_box: Option<(i32, i32, i32, i32)> = None;
         let (w, h) = (self.width, self.height);
         let key_h = self.key_height();
         let off = SUGGEST_H as i32;
@@ -459,6 +481,11 @@ impl App {
                 if !cap.label.is_empty() {
                     cv.draw_text_centered(&cap.label, kx, ky, kw, kh, scale, COL_LABEL);
                 }
+                // The pressed-key highlight is dynamic: it must repaint when the
+                // press moves or lifts. (active_shift flips only on a full redraw.)
+                if self.pressed == Some(i) {
+                    union_box(&mut dyn_box, r.x, r.y + off, r.w, r.h);
+                }
             }
 
             // Key pop-up preview: while a character key is held (a tap, not yet
@@ -477,6 +504,7 @@ impl App {
                             cv.fill_rect(px, py, pw, ph, COL_KEY_PRESSED);
                             let pscale = (scale + 2).min(8);
                             cv.draw_text_centered(&cap.label, px, py, pw, ph, pscale, COL_LABEL);
+                            union_box(&mut dyn_box, px, py, pw, ph);
                         }
                     }
                 }
@@ -501,12 +529,39 @@ impl App {
                         COL_TRAIL,
                     );
                 }
+                // Trail bbox, inflated past the 4px line width + smoothing slack.
+                for p in &trail.points {
+                    union_box(&mut dyn_box, p.x as i32 - 4, p.y as i32 - 4, 8, 8);
+                }
             }
         }
 
-        self.layer
-            .wl_surface()
-            .damage_buffer(0, 0, w as i32, h as i32);
+        // Damage: the whole surface for a full repaint, else the union of this
+        // frame's dynamic box and last frame's (so pixels the overlay vacated are
+        // recomposited). The buffer itself is always fully rendered, so partial
+        // damage can never leave a stale region — it only spares the compositor.
+        let (dx, dy, dw, dh) = if full {
+            (0, 0, w as i32, h as i32)
+        } else {
+            let mut u = self.prev_dyn;
+            if let Some((x0, y0, x1, y1)) = dyn_box {
+                union_box(&mut u, x0, y0, x1 - x0, y1 - y0);
+            }
+            match u {
+                Some((x0, y0, x1, y1)) => {
+                    let x0 = x0.clamp(0, w as i32);
+                    let y0 = y0.clamp(0, h as i32);
+                    let x1 = x1.clamp(0, w as i32);
+                    let y1 = y1.clamp(0, h as i32);
+                    (x0, y0, x1 - x0, y1 - y0)
+                }
+                None => (0, 0, 0, 0),
+            }
+        };
+        self.prev_dyn = dyn_box;
+        if dw > 0 && dh > 0 {
+            self.layer.wl_surface().damage_buffer(dx, dy, dw, dh);
+        }
         buffer
             .attach_to(self.layer.wl_surface())
             .expect("failed to attach buffer");
@@ -584,7 +639,7 @@ impl App {
         if self.pressed.is_some() && pixel_path_len(&self.gesture) > self.tap_threshold() {
             self.pressed = None;
         }
-        self.draw(qh);
+        self.draw_motion(qh);
     }
 
     fn on_release(&mut self, qh: &QueueHandle<Self>) {
@@ -1028,6 +1083,15 @@ fn pixel_path_len(g: &[(f32, f32, u32)]) -> f32 {
             (dx * dx + dy * dy).sqrt()
         })
         .sum()
+}
+
+/// Grow an `(x0, y0, x1, y1)` corner box to include the rect `(x, y, w, h)`.
+fn union_box(acc: &mut Option<(i32, i32, i32, i32)>, x: i32, y: i32, w: i32, h: i32) {
+    let (x0, y0, x1, y1) = (x, y, x + w, y + h);
+    *acc = Some(match *acc {
+        None => (x0, y0, x1, y1),
+        Some((ax0, ay0, ax1, ay1)) => (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1)),
+    });
 }
 
 /// Scale factor for key labels, derived from row height so labels stay legible.
