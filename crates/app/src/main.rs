@@ -43,6 +43,8 @@ enum SuggestKind {
     Completions,
     /// Alternates for a word just committed by a gesture.
     GestureAlternates,
+    /// Likely next words (bigram model) shown when no word is in progress.
+    Predictions,
 }
 
 use std::collections::HashMap;
@@ -203,15 +205,18 @@ fn main() {
     for (word, boost) in &learned {
         decoder.learn(word, *boost);
     }
+    let bigrams_path = bigrams_path();
+    let bigrams = load_bigrams(&bigrams_path);
     eprintln!(
         "swype-kbd: decoder ready — {} word templates from {} (built in {} ms); \
-         {} learned, {} personal ({} active)",
+         {} learned, {} personal ({} active), {} prediction contexts",
         decoder.templates_len(),
         source,
         t0.elapsed().as_millis(),
         learned.len(),
         personal.len(),
         promoted,
+        bigrams.len(),
     );
 
     let mut app = App {
@@ -242,6 +247,10 @@ fn main() {
         personal,
         personal_path,
         personal_seed,
+        bigrams,
+        bigrams_path,
+        prev_word: None,
+        last_bigram: None,
         gesture: Vec::new(),
         gesture_start: None,
         pressing: false,
@@ -316,6 +325,16 @@ struct App {
     personal_path: PathBuf,
     /// Starting log-frequency for a freshly promoted personal word.
     personal_seed: f32,
+    /// Next-word model: previous lowercase word -> (next word -> times seen).
+    /// Persisted to `bigrams_path`.
+    bigrams: HashMap<String, HashMap<String, u32>>,
+    bigrams_path: PathBuf,
+    /// The previous finished word, the context for next-word prediction. Reset
+    /// to `None` at sentence boundaries (Enter, `.`/`!`/`?`).
+    prev_word: Option<String>,
+    /// The most recently learned `(prev, next)` bigram, so a tap-to-replace
+    /// correction can move the count from the rejected word onto the chosen one.
+    last_bigram: Option<(String, String)>,
     /// In-progress swipe: surface-pixel `(x, y, ms)` samples while pressing.
     gesture: Vec<(f32, f32, u32)>,
     gesture_start: Option<Instant>,
@@ -423,6 +442,46 @@ fn save_personal(path: &Path, map: &HashMap<String, u32>) {
     }
     if let Err(e) = std::fs::write(path, s) {
         eprintln!("swype-kbd: could not save personal dictionary to {}: {e}", path.display());
+    }
+}
+
+/// Path to the persisted next-word (bigram) counts.
+fn bigrams_path() -> PathBuf {
+    state_path("bigrams.txt")
+}
+
+/// Load `prev next count` lines into a prev -> (next -> count) map. Lowercase
+/// keys; missing file or malformed lines are skipped.
+fn load_bigrams(path: &Path) -> HashMap<String, HashMap<String, u32>> {
+    let mut map: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(p), Some(n), Some(c)) = (it.next(), it.next(), it.next()) {
+                if let Ok(count) = c.parse::<u32>() {
+                    map.entry(p.to_ascii_lowercase())
+                        .or_default()
+                        .insert(n.to_ascii_lowercase(), count);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Persist the bigram counts. Best-effort; errors are logged.
+fn save_bigrams(path: &Path, map: &HashMap<String, HashMap<String, u32>>) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut s = String::new();
+    for (prev, succ) in map {
+        for (next, c) in succ {
+            s.push_str(&format!("{prev} {next} {c}\n"));
+        }
+    }
+    if let Err(e) = std::fs::write(path, s) {
+        eprintln!("swype-kbd: could not save next-word data to {}: {e}", path.display());
     }
 }
 
@@ -718,6 +777,7 @@ impl App {
                 match self.suggest_kind {
                     SuggestKind::Completions => self.complete_with(&word),
                     SuggestKind::GestureAlternates => self.replace_with(&word),
+                    SuggestKind::Predictions => self.predict_with(&word),
                     SuggestKind::None => {}
                 }
                 self.draw(qh);
@@ -817,6 +877,7 @@ impl App {
                 }
                 self.pending_cap = false; // a word isn't a sentence end
                 self.commit_word(&word);
+                self.finished_word(&word); // next-word context
                 self.reward_use(&word); // the user accepted this swipe
                 self.suggestions = cands
                     .iter()
@@ -878,6 +939,8 @@ impl App {
             }
         }
         save_learned(&self.learned_path, &self.learned);
+        // Repoint the just-learned bigram at the corrected word.
+        self.relearn_last(word);
         println!("replace -> '{word}' (rejected {rejected:?})");
     }
 
@@ -912,8 +975,7 @@ impl App {
 
     /// A tap-typed word just finished (a terminator followed a run of letters).
     /// If it's already known, reward it (passive learning); otherwise count it
-    /// toward the personal dictionary and promote it once it crosses the
-    /// threshold, after which it decodes and completes like any other word.
+    /// toward the personal dictionary. Either way, record it as next-word context.
     fn typed_word_finished(&mut self, word: &str) {
         if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphabetic()) {
             return;
@@ -921,21 +983,136 @@ impl App {
         let key = word.to_ascii_lowercase();
         if self.decoder.contains(&key) {
             self.reward_use(&key);
-            return;
+        } else if word.chars().count() >= MIN_PERSONAL_LEN {
+            self.count_new_word(&key);
         }
-        if word.chars().count() < MIN_PERSONAL_LEN {
-            return;
-        }
-        let count = self.personal.entry(key.clone()).or_insert(0);
+        self.finished_word(&key);
+    }
+
+    /// Count an out-of-dictionary word toward the personal dictionary, promoting
+    /// it once it crosses the threshold — after which it decodes and completes
+    /// like any other word.
+    fn count_new_word(&mut self, key: &str) {
+        let count = self.personal.entry(key.to_string()).or_insert(0);
         *count += 1;
         let count = *count;
-        if count == PROMOTE_THRESHOLD && self.decoder.add_word(&key, self.personal_seed) {
+        if count == PROMOTE_THRESHOLD && self.decoder.add_word(key, self.personal_seed) {
             // Start it a touch above its seed so a just-learned word is usable.
-            self.adjust_learning(&key, PASSIVE_DELTA);
+            self.adjust_learning(key, PASSIVE_DELTA);
             save_learned(&self.learned_path, &self.learned);
             println!("personal dict: added '{key}' (typed {count}x)");
         }
         save_personal(&self.personal_path, &self.personal);
+    }
+
+    /// Record that `word` was emitted as a complete word (by any channel): learn
+    /// the (previous word -> word) bigram for next-word prediction and make
+    /// `word` the new context. Lowercased; non-word input clears the context.
+    fn finished_word(&mut self, word: &str) {
+        let w = word.to_ascii_lowercase();
+        if w.is_empty() || !w.chars().all(|c| c.is_ascii_alphabetic()) {
+            self.prev_word = None;
+            self.last_bigram = None;
+            return;
+        }
+        if let Some(prev) = self.prev_word.take() {
+            if prev != w {
+                self.bump_bigram(&prev, &w);
+                self.last_bigram = Some((prev, w.clone()));
+            }
+        }
+        self.prev_word = Some(w);
+    }
+
+    /// Clear the next-word context (at sentence boundaries).
+    fn reset_context(&mut self) {
+        self.prev_word = None;
+        self.last_bigram = None;
+    }
+
+    /// Increment the (prev -> next) bigram count and persist.
+    fn bump_bigram(&mut self, prev: &str, next: &str) {
+        let succ = self.bigrams.entry(prev.to_string()).or_default();
+        *succ.entry(next.to_string()).or_insert(0) += 1;
+        save_bigrams(&self.bigrams_path, &self.bigrams);
+    }
+
+    /// A tap-to-replace correction supersedes the word just committed, so move
+    /// the bigram we learned from the rejected word onto the chosen one and make
+    /// the chosen word the new context.
+    fn relearn_last(&mut self, chosen: &str) {
+        let c = chosen.to_ascii_lowercase();
+        if let Some((prev, rejected)) = self.last_bigram.take() {
+            if rejected != c {
+                if let Some(succ) = self.bigrams.get_mut(&prev) {
+                    if let Some(cnt) = succ.get_mut(&rejected) {
+                        *cnt = cnt.saturating_sub(1);
+                        if *cnt == 0 {
+                            succ.remove(&rejected);
+                        }
+                    }
+                }
+                self.bump_bigram(&prev, &c); // also persists
+                self.last_bigram = Some((prev, c.clone()));
+            } else {
+                self.last_bigram = Some((prev, rejected));
+            }
+        }
+        self.prev_word = Some(c);
+    }
+
+    /// The most likely next words for the current context (previous word), best
+    /// first, capped at 4. Empty when there's no context or nothing learned.
+    fn predict_next(&self) -> Vec<String> {
+        let Some(prev) = &self.prev_word else {
+            return Vec::new();
+        };
+        let Some(succ) = self.bigrams.get(prev) else {
+            return Vec::new();
+        };
+        let mut v: Vec<(&String, u32)> = succ.iter().map(|(w, &c)| (w, c)).collect();
+        // Most frequent first; ties broken alphabetically for a stable bar.
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        v.into_iter().take(4).map(|(w, _)| w.clone()).collect()
+    }
+
+    /// Fill the suggestion bar with next-word predictions for the current
+    /// context. Leaves gesture alternates alone; clears stale predictions when
+    /// none apply.
+    fn show_predictions(&mut self) {
+        let preds = self.predict_next();
+        if preds.is_empty() {
+            if matches!(self.suggest_kind, SuggestKind::Completions | SuggestKind::Predictions) {
+                self.suggestions.clear();
+                self.suggest_kind = SuggestKind::None;
+            }
+            return;
+        }
+        if self.suggest_kind == SuggestKind::GestureAlternates {
+            return; // keep the just-swiped word's alternates tappable
+        }
+        let cap = self.pending_cap || self.shift != Shift::Off;
+        self.suggestions = preds
+            .iter()
+            .map(|w| if cap { capitalize(w) } else { w.clone() })
+            .collect();
+        self.suggest_kind = SuggestKind::Predictions;
+    }
+
+    /// Insert a tapped next-word prediction as a whole word plus a space.
+    fn predict_with(&mut self, word: &str) {
+        for ch in word.chars() {
+            self.type_char(ch);
+        }
+        self.type_char(' ');
+        self.auto_space = true;
+        self.last_committed = Some(word.to_ascii_lowercase());
+        // A backspace now removes the inserted word + space as a unit.
+        self.undo = Some(word.chars().count() as u32 + 1);
+        self.finished_word(word);
+        self.reward_use(word);
+        self.refresh_completions();
+        println!("predict -> '{word}'");
     }
 
     /// Which suggestion (if any) sits under pixel x in the suggestion bar.
@@ -991,6 +1168,7 @@ impl App {
             KeyAction::Enter => {
                 let w = self.current_word();
                 self.typed_word_finished(&w);
+                self.reset_context(); // a new line starts a new context
                 self.vk_tap(input::KEY_ENTER);
                 self.push_left('\n');
                 self.auto_space = false;
@@ -1051,6 +1229,9 @@ impl App {
             self.shift = Shift::Off;
         }
         self.pending_cap = is_sentence_end(c);
+        if self.pending_cap {
+            self.reset_context(); // sentence end breaks the next-word context
+        }
     }
 
     /// The word for prediction: the trailing run of letters left of the cursor.
@@ -1064,19 +1245,22 @@ impl App {
         rev.chars().rev().collect()
     }
 
-    /// Recompute predictive completions from the word left of the cursor.
+    /// Recompute the predictive suggestion bar: completions of the word being
+    /// typed, or — when no word is in progress — next-word predictions.
     fn refresh_completions(&mut self) {
-        let word = if self.base == Base::Letters {
-            self.current_word()
-        } else {
-            String::new()
-        };
-        if word.is_empty() {
-            // Don't disturb gesture alternates; just drop stale completions.
-            if self.suggest_kind == SuggestKind::Completions {
+        if self.base != Base::Letters {
+            // Off the letters layer, drop our predictive entries (but leave any
+            // gesture alternates the user might still tap).
+            if matches!(self.suggest_kind, SuggestKind::Completions | SuggestKind::Predictions) {
                 self.suggestions.clear();
                 self.suggest_kind = SuggestKind::None;
             }
+            return;
+        }
+        let word = self.current_word();
+        if word.is_empty() {
+            // No word in progress: offer the likely next word instead.
+            self.show_predictions();
             return;
         }
         let comps = self.decoder.complete(&word, 4);
@@ -1108,6 +1292,7 @@ impl App {
         self.last_committed = Some(word.to_ascii_lowercase());
         // A backspace now undoes the completion, restoring the typed prefix.
         self.undo = Some(suffix.len() as u32 + 1);
+        self.finished_word(word); // next-word context
         self.reward_use(word); // the user accepted this completion
         self.refresh_completions();
         println!("complete -> '{word}'");
