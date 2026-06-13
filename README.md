@@ -14,6 +14,8 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestone history.
   velocity-weighted matching) commits the most likely word plus a space. A
   suggestion bar shows alternates — tap to replace.
 - **Tap typing** with predictive **word completions** in the suggestion bar.
+- **Next-word prediction** — a learned bigram model offers the word you usually
+  type next, right after you finish a word.
 - **Pointer and touch** input (`wl_pointer` and `wl_touch`).
 - **Input layers** — Shift (one-shot → caps-lock → off) and two symbol pages
   cover the full ASCII set, through both the input-method and virtual-keyboard
@@ -21,8 +23,12 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and milestone history.
 - **Smart typing** — gesture words commit with a trailing space; punctuation
   tucks against the word (`hello .` → `hello.`); the first letter after `. ! ?`
   or Enter auto-capitalizes.
-- **Per-user learning** — choosing a suggestion nudges word frequencies, saved to
-  `$XDG_STATE_HOME/swype-kbd/learned.txt`.
+- **Learns your tendencies** — every word you accept (swipe, complete, or tap
+  out) gently rises in frequency, and corrections converge a confusable pair.
+  Words you type that aren't in the dictionary join a **personal dictionary**
+  after a few uses, becoming swipeable and completable like any other word.
+  All of it persists under `$XDG_STATE_HOME/swype-kbd/` (`learned.txt`,
+  `personal.txt`, `bigrams.txt`).
 - **One-tap undo** — Backspace right after a committed word removes it whole.
 - **Polished UI** — anti-aliased TrueType labels, rounded keys with depth, a key
   pop-up preview, and a glowing gesture trail, all from a dependency-light

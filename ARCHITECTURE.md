@@ -198,6 +198,30 @@ hot loop is flat `f32` arithmetic over fixed-size arrays, and the candidate set
 is small — comfortably under 30 ms. We measure it in a Criterion-style bench and
 log the p99 in the app.
 
+### 4.5b Personalization (learning over time)
+The decoder's frequency prior is per-user adaptive, persisted under
+`$XDG_STATE_HOME/swype-kbd/` and reloaded at startup:
+
+- **Passive frequency learning** (`learned.txt`): every accepted word — swipe
+  top-1, completion tap, prediction tap, or a known word tapped out — gets a
+  small clamped boost to its log-frequency, so a person's real vocabulary floats
+  up. A tap-to-replace correction rewards the chosen word and decays the rejected
+  one (never below its base rank), so confusable pairs converge.
+- **Personal dictionary** (`personal.txt`): a tap-typed word not in the base list
+  is counted; after a small threshold it is inserted into the live decoder
+  (`Decoder::add_word` builds a template and indexes it), seeded at the
+  dictionary's 80th-frequency percentile (`Decoder::typical_ln_freq`, scale-robust
+  across the embedded and 50k lists). It is then swipeable and completable. The
+  threshold guards a one-off typo from becoming a word.
+- **Next-word prediction** (`bigrams.txt`): a `prev → (next → count)` map learned
+  from every committed word (any channel, including out-of-dictionary words). When
+  no word is in progress, the most likely successors fill the suggestion bar; the
+  context resets at sentence boundaries (`Enter`, `. ! ?`). A correction repoints
+  the just-learned bigram from the rejected word onto the chosen one.
+
+The decoder crate stays pure: it exposes `add_word` / `typical_ln_freq` /
+`learn`, while all capture, thresholds, and persistence live in the app.
+
 ### 4.6 Test strategy
 - **Synthetic corpus:** take each word's ideal trace and apply parametric
   perturbations — Gaussian jitter, corner-cutting (under-shoot at turns),
