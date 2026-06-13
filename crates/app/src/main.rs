@@ -184,18 +184,34 @@ fn main() {
     let (dict, source) = load_dictionary();
     let t0 = Instant::now();
     let mut decoder = Decoder::with_defaults(KeyboardLayout::qwerty(), dict);
-    // Apply persisted per-user learning on top of the base frequencies.
+    // Seed personal words off the base frequency distribution (before learned
+    // boosts shift it), then promote any that have crossed the threshold so
+    // they're swipeable + completable from startup.
+    let personal_seed = decoder.typical_ln_freq();
+    let personal_path = personal_path();
+    let personal = load_personal(&personal_path);
+    let mut promoted = 0usize;
+    for (word, &count) in &personal {
+        if count >= PROMOTE_THRESHOLD && decoder.add_word(word, personal_seed) {
+            promoted += 1;
+        }
+    }
+    // Apply persisted per-user learning on top of the base frequencies (this
+    // also lifts promoted personal words by their accumulated passive boosts).
     let learned_path = learned_path();
     let learned = load_learned(&learned_path);
     for (word, boost) in &learned {
         decoder.learn(word, *boost);
     }
     eprintln!(
-        "swype-kbd: decoder ready — {} word templates from {} (built in {} ms); {} learned words",
+        "swype-kbd: decoder ready — {} word templates from {} (built in {} ms); \
+         {} learned, {} personal ({} active)",
         decoder.templates_len(),
         source,
         t0.elapsed().as_millis(),
         learned.len(),
+        personal.len(),
+        promoted,
     );
 
     let mut app = App {
@@ -223,6 +239,9 @@ fn main() {
         decoder,
         learned,
         learned_path,
+        personal,
+        personal_path,
+        personal_seed,
         gesture: Vec::new(),
         gesture_start: None,
         pressing: false,
@@ -290,6 +309,13 @@ struct App {
     /// persisted to `learned_path`.
     learned: HashMap<String, f32>,
     learned_path: PathBuf,
+    /// Personal-dictionary usage counts (lowercase out-of-dictionary word ->
+    /// times typed). At `PROMOTE_THRESHOLD` the word is added to the decoder so
+    /// it becomes swipeable + completable. Persisted to `personal_path`.
+    personal: HashMap<String, u32>,
+    personal_path: PathBuf,
+    /// Starting log-frequency for a freshly promoted personal word.
+    personal_seed: f32,
     /// In-progress swipe: surface-pixel `(x, y, ms)` samples while pressing.
     gesture: Vec<(f32, f32, u32)>,
     gesture_start: Option<Instant>,
@@ -338,13 +364,66 @@ struct App {
 const LEARN_DELTA: f32 = 8.0;
 const LEARN_CAP: f32 = 24.0;
 
-/// Path to the persisted per-user learned-words file (XDG state dir).
-fn learned_path() -> PathBuf {
+/// Gentle reward applied to a word every time the user actually uses it — types,
+/// swipes, or completes it. Passive frequency learning, so a person's real
+/// vocabulary floats to the top over time. Smaller than a correction's reward;
+/// shares `LEARN_CAP` and the same decay-on-rejection.
+const PASSIVE_DELTA: f32 = 2.0;
+
+/// Times a new (out-of-dictionary) word must be typed before it joins the
+/// personal dictionary — guards a one-off typo against becoming a real word.
+const PROMOTE_THRESHOLD: u32 = 3;
+/// Shortest word eligible for the personal dictionary.
+const MIN_PERSONAL_LEN: usize = 2;
+
+/// A file under the per-user state directory ($XDG_STATE_HOME/swype-kbd, else
+/// ~/.local/state/swype-kbd), where learned data is persisted.
+fn state_path(file: &str) -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("swype-kbd").join("learned.txt")
+    base.join("swype-kbd").join(file)
+}
+
+/// Path to the persisted per-user learned-words file.
+fn learned_path() -> PathBuf {
+    state_path("learned.txt")
+}
+
+/// Path to the persisted personal-dictionary usage counts.
+fn personal_path() -> PathBuf {
+    state_path("personal.txt")
+}
+
+/// Load `word count` lines into a map (lowercase keys). Missing file -> empty.
+fn load_personal(path: &Path) -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(w), Some(c)) = (it.next(), it.next()) {
+                if let Ok(count) = c.parse::<u32>() {
+                    map.insert(w.to_ascii_lowercase(), count);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Persist the personal-dictionary counts. Best-effort; errors are logged.
+fn save_personal(path: &Path, map: &HashMap<String, u32>) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut s = String::new();
+    for (w, c) in map {
+        s.push_str(&format!("{w} {c}\n"));
+    }
+    if let Err(e) = std::fs::write(path, s) {
+        eprintln!("swype-kbd: could not save personal dictionary to {}: {e}", path.display());
+    }
 }
 
 /// Load `word boost` lines into a map (lowercase keys). Missing file -> empty.
@@ -738,6 +817,7 @@ impl App {
                 }
                 self.pending_cap = false; // a word isn't a sentence end
                 self.commit_word(&word);
+                self.reward_use(&word); // the user accepted this swipe
                 self.suggestions = cands
                     .iter()
                     .take(4)
@@ -793,7 +873,7 @@ impl App {
         // confusable pair converges instead of the first-boosted word sticking.
         self.adjust_learning(word, LEARN_DELTA);
         if let Some(r) = &rejected {
-            if r.to_ascii_lowercase() != word.to_ascii_lowercase() {
+            if !r.eq_ignore_ascii_case(word) {
                 self.adjust_learning(r, -LEARN_DELTA);
             }
         }
@@ -822,6 +902,42 @@ impl App {
         println!("learned '{key}' -> {new:+.1}");
     }
 
+    /// Gently reward a word the user actually used (typed, swiped, or
+    /// completed), so genuinely-used vocabulary rises over time. Passive
+    /// learning: shares the correction clamp and persistence, smaller delta.
+    fn reward_use(&mut self, word: &str) {
+        self.adjust_learning(word, PASSIVE_DELTA);
+        save_learned(&self.learned_path, &self.learned);
+    }
+
+    /// A tap-typed word just finished (a terminator followed a run of letters).
+    /// If it's already known, reward it (passive learning); otherwise count it
+    /// toward the personal dictionary and promote it once it crosses the
+    /// threshold, after which it decodes and completes like any other word.
+    fn typed_word_finished(&mut self, word: &str) {
+        if word.is_empty() || !word.chars().all(|c| c.is_ascii_alphabetic()) {
+            return;
+        }
+        let key = word.to_ascii_lowercase();
+        if self.decoder.contains(&key) {
+            self.reward_use(&key);
+            return;
+        }
+        if word.chars().count() < MIN_PERSONAL_LEN {
+            return;
+        }
+        let count = self.personal.entry(key.clone()).or_insert(0);
+        *count += 1;
+        let count = *count;
+        if count == PROMOTE_THRESHOLD && self.decoder.add_word(&key, self.personal_seed) {
+            // Start it a touch above its seed so a just-learned word is usable.
+            self.adjust_learning(&key, PASSIVE_DELTA);
+            save_learned(&self.learned_path, &self.learned);
+            println!("personal dict: added '{key}' (typed {count}x)");
+        }
+        save_personal(&self.personal_path, &self.personal);
+    }
+
     /// Which suggestion (if any) sits under pixel x in the suggestion bar.
     fn suggestion_at(&self, px: f32) -> Option<String> {
         let n = self.suggestions.len().min(4);
@@ -847,6 +963,8 @@ impl App {
         match action {
             KeyAction::Char(c) => self.type_key_char(c),
             KeyAction::Space => {
+                let w = self.current_word();
+                self.typed_word_finished(&w);
                 if !self.commit_text(" ") {
                     self.vk_type_char(' ');
                 }
@@ -871,6 +989,8 @@ impl App {
                 self.pending_cap = false;
             }
             KeyAction::Enter => {
+                let w = self.current_word();
+                self.typed_word_finished(&w);
                 self.vk_tap(input::KEY_ENTER);
                 self.push_left('\n');
                 self.auto_space = false;
@@ -911,6 +1031,12 @@ impl App {
     /// a preceding auto-spaced word) and arming auto-capitalization after a
     /// sentence end.
     fn type_key_char(&mut self, c: char) {
+        // A non-letter ends any run of letters: capture that finished word for
+        // the personal dictionary / passive learning before typing the symbol.
+        if !c.is_ascii_alphabetic() {
+            let w = self.current_word();
+            self.typed_word_finished(&w);
+        }
         if self.auto_space && is_tight_punct(c) {
             // "word ." -> "word. ": drop the trailing space, then "<punct> ".
             self.delete_one();
@@ -982,6 +1108,7 @@ impl App {
         self.last_committed = Some(word.to_ascii_lowercase());
         // A backspace now undoes the completion, restoring the typed prefix.
         self.undo = Some(suffix.len() as u32 + 1);
+        self.reward_use(word); // the user accepted this completion
         self.refresh_completions();
         println!("complete -> '{word}'");
     }
