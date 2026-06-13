@@ -92,6 +92,12 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
 const KBD_HEIGHT: u32 = 300;
 /// Height of the suggestion bar strip at the top of the surface.
 const SUGGEST_H: u32 = 48;
+/// Height of the collapsed "handle" the keyboard shrinks to when auto-hidden and
+/// no text field is focused. Tapping it summons the full keyboard back.
+const HANDLE_HEIGHT: u32 = 36;
+/// Width of the chevron "hide" button at the right of the suggestion bar (shown
+/// only in auto-hide mode), which collapses the keyboard back to the handle.
+const HIDE_W: i32 = 44;
 /// A press that travels less than this fraction of a key width is a tap, not a
 /// gesture.
 const TAP_FRACTION: f32 = 0.45;
@@ -120,6 +126,28 @@ const KEY_RADIUS: f32 = 9.0;
 const PILL_RADIUS: f32 = 12.0;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "swype-kbd — Wayland swipe-typing on-screen keyboard\n\
+             \n\
+             USAGE:\n    swype-kbd [--always-on]\n\
+             \n\
+             OPTIONS:\n\
+             \x20   --always-on   Keep the keyboard docked even when no text field is\n\
+             \x20                 focused. Default: auto-hide to a slim tap handle when\n\
+             \x20                 nothing is focused, and pop back up on typing context.\n\
+             \x20   --help, -h    Show this help.\n\
+             \n\
+             ENV:\n\
+             \x20   SWYPE_DICT    Path to a 'word count' dictionary (default: bundled list)."
+        );
+        return;
+    }
+    // Auto-hide (collapse to a handle when no field is focused) is the default;
+    // --always-on restores the old behavior of staying fully docked.
+    let auto_hide = !args.iter().any(|a| a == "--always-on");
+
     let conn = Connection::connect_to_env()
         .expect("failed to connect to a Wayland display (is WAYLAND_DISPLAY set?)");
     let (globals, mut event_queue) =
@@ -138,8 +166,11 @@ fn main() {
     let layer =
         layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("swype-kbd"), None);
     layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, KBD_HEIGHT);
-    layer.set_exclusive_zone(KBD_HEIGHT as i32);
+    // In auto-hide mode we start collapsed to the handle and expand on the first
+    // input-method `activate`; otherwise we dock full-height immediately.
+    let initial_h = if auto_hide { HANDLE_HEIGHT } else { KBD_HEIGHT };
+    layer.set_size(0, initial_h);
+    layer.set_exclusive_zone(initial_h as i32);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
 
@@ -229,8 +260,10 @@ fn main() {
         keyboard: VisualKeyboard::new(),
         font: FontRef::try_from_slice(FONT_BYTES).expect("bundled font failed to parse"),
         width: 0,
-        height: KBD_HEIGHT,
+        height: initial_h,
         configured: false,
+        auto_hide,
+        expanded: !auto_hide,
         pointer: None,
         touch: None,
         active_touch: None,
@@ -271,6 +304,10 @@ fn main() {
         key_time: 0,
     };
 
+    eprintln!(
+        "swype-kbd: auto-hide {} (tap the handle to summon, chevron to hide)",
+        if auto_hide { "ON; --always-on to keep it docked" } else { "OFF (--always-on)" }
+    );
     eprintln!("swype-kbd: layer surface created; waiting for configure…");
     while !app.exit {
         event_queue
@@ -292,6 +329,13 @@ struct App {
     width: u32,
     height: u32,
     configured: bool,
+    /// When true, the keyboard collapses to a slim tap handle whenever no text
+    /// field is focused, and pops back to full height on the next typing context.
+    /// Disabled by `--always-on`.
+    auto_hide: bool,
+    /// Current visibility: `true` = full keyboard, `false` = collapsed handle.
+    /// Always `true` when `auto_hide` is off.
+    expanded: bool,
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
     /// The touch-point id currently driving a press/gesture (single-touch).
@@ -570,7 +614,70 @@ impl App {
     /// Full repaint with whole-surface damage — for structural changes (layer or
     /// shift switch, suggestion-bar updates, commits, resize).
     fn draw(&mut self, qh: &QueueHandle<Self>) {
-        self.render(qh, true);
+        if self.expanded {
+            self.render(qh, true);
+        } else {
+            self.render_handle(qh);
+        }
+    }
+
+    /// Width available to suggestion cells. In auto-hide mode the rightmost
+    /// `HIDE_W` pixels of the suggestion bar are reserved for the hide chevron.
+    fn sugg_width(&self) -> i32 {
+        if self.auto_hide {
+            (self.width as i32 - HIDE_W).max(0)
+        } else {
+            self.width as i32
+        }
+    }
+
+    /// Expand to the full keyboard or collapse to the handle by re-requesting the
+    /// layer-surface size; the compositor replies with a `configure` that drives
+    /// the actual repaint at the new height. No-op if already in that state or if
+    /// auto-hide is disabled (then it stays docked).
+    fn set_expanded(&mut self, expanded: bool) {
+        if !self.auto_hide || self.expanded == expanded {
+            return;
+        }
+        self.expanded = expanded;
+        // Abandon any in-flight press so a collapse mid-gesture leaves no state.
+        self.pressing = false;
+        self.pressed = None;
+        self.gesture.clear();
+        self.prev_dyn = None;
+        let h = if expanded { KBD_HEIGHT } else { HANDLE_HEIGHT };
+        self.layer.set_size(0, h);
+        self.layer.set_exclusive_zone(h as i32);
+        self.layer.commit();
+    }
+
+    /// Render the collapsed handle: a slim bar with a centered grip pill. The
+    /// whole strip is tappable to summon the full keyboard.
+    fn render_handle(&mut self, _qh: &QueueHandle<Self>) {
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        let (w, h) = (self.width, self.height);
+        let stride = w as i32 * 4;
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+            .expect("failed to create buffer");
+        {
+            let mut cv = Canvas::new(canvas, w as usize, h as usize);
+            cv.clear(COL_SUGGEST_BG);
+            let gw = (w as i32 / 5).clamp(96, 240);
+            let gx = (w as i32 - gw) / 2;
+            let gh = 5;
+            let gy = (h as i32 - gh) / 2;
+            cv.fill_round_rect(gx, gy, gw, gh, 2.5, COL_LABEL_DIM);
+        }
+        self.layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
+        buffer
+            .attach_to(self.layer.wl_surface())
+            .expect("failed to attach buffer");
+        self.layer.commit();
+        self.prev_dyn = None;
     }
 
     /// Repaint reporting only the changed region — for the high-frequency motion
@@ -594,6 +701,7 @@ impl App {
         let off = SUGGEST_H as i32;
         let kind = self.current_kind();
         let shift_on = self.shift != Shift::Off;
+        let sw = self.sugg_width();
         let stride = w as i32 * 4;
         let (buffer, canvas) = self
             .pool
@@ -608,7 +716,7 @@ impl App {
             cv.fill_rect(0, 0, w as i32, SUGGEST_H as i32, COL_SUGGEST_BG);
             let n = self.suggestions.len().min(4);
             if n > 0 {
-                let cellw = w as i32 / n as i32;
+                let cellw = sw / n as i32;
                 let ssize = (SUGGEST_H as f32 * 0.42).round();
                 for (i, word) in self.suggestions.iter().take(4).enumerate() {
                     let cx = i as i32 * cellw;
@@ -627,6 +735,19 @@ impl App {
                     }
                     cv.text_centered(&self.font, word, cx, 0, cellw, SUGGEST_H as i32, ssize, COL_LABEL);
                 }
+            }
+            // Hide chevron (auto-hide mode only): a downward "v" at the right edge
+            // that collapses the keyboard back to the handle when tapped.
+            if self.auto_hide {
+                cv.fill_rect(sw, 10, 1, SUGGEST_H as i32 - 20, COL_SUGGEST_SEP);
+                let cxh = sw as f32 + HIDE_W as f32 / 2.0;
+                let cyh = SUGGEST_H as f32 / 2.0;
+                let chevron = [
+                    (cxh - 8.0, cyh - 4.0),
+                    (cxh, cyh + 5.0),
+                    (cxh + 8.0, cyh - 4.0),
+                ];
+                cv.stroke_trail(&chevron, 3.0, COL_LABEL_DIM, 0.95);
             }
             // Hairline under the suggestion bar to separate it from the keys.
             cv.fill_rect(0, off - 1, w as i32, 1, COL_BG);
@@ -770,9 +891,20 @@ impl App {
     fn on_press(&mut self, x: f64, y: f64, qh: &QueueHandle<Self>) {
         let (px, py) = (x as f32, y as f32);
 
+        // Collapsed: any tap on the handle summons the full keyboard.
+        if !self.expanded {
+            self.set_expanded(true);
+            return;
+        }
+
         // A press in the suggestion bar acts on the tapped word: complete the
         // word being typed, or replace the word a gesture just committed.
         if (py as u32) < SUGGEST_H {
+            // The hide chevron at the right edge collapses back to the handle.
+            if self.auto_hide && px >= self.sugg_width() as f32 {
+                self.set_expanded(false);
+                return;
+            }
             if let Some(word) = self.suggestion_at(px) {
                 match self.suggest_kind {
                     SuggestKind::Completions => self.complete_with(&word),
@@ -1121,7 +1253,7 @@ impl App {
         if n == 0 {
             return None;
         }
-        let cell = self.width as f32 / n as f32;
+        let cell = self.sugg_width() as f32 / n as f32;
         let idx = ((px / cell) as usize).min(n - 1);
         Some(self.suggestions[idx].clone())
     }
@@ -1775,13 +1907,23 @@ impl Dispatch<ZwpInputMethodV2, ()> for App {
             Event::Activate => state.im_pending_active = true,
             Event::Deactivate => state.im_pending_active = false,
             Event::Done => {
+                let was_active = state.im_active;
                 state.im_active = state.im_pending_active;
                 state.im_serial = state.im_serial.wrapping_add(1);
+                // Follow text-field focus: a field gaining focus pops the keyboard
+                // up, losing focus collapses it to the handle. No-op when auto-hide
+                // is off, or when the user has manually toggled to the same state.
+                if state.im_active != was_active {
+                    state.set_expanded(state.im_active);
+                }
             }
             Event::Unavailable => {
                 eprintln!("input-method: another input method is active; using key synth only");
                 state.input_method = None;
                 state.im_active = false;
+                // No focus events will arrive now, so don't leave it stuck
+                // collapsed — dock it (the virtual-keyboard path still types).
+                state.set_expanded(true);
             }
             // surrounding_text / text_change_cause / content_type: unused in M2.
             _ => {}
